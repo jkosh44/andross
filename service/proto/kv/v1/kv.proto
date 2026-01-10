@@ -1,0 +1,10 @@
+syntax = "proto3";
+package service.proto.kv.v1;
+
+service NoOpService {
+  rpc NoOp(NoOpRequest) returns (NoOpResponse);
+}
+
+message NoOpRequest {}
+
+message NoOpResponse {}

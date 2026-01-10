@@ -1,12 +1,21 @@
-[package]
-name = "andross"
+[workspace]
+resolver = "2"
+members = ["client", "server", "service"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89.0"
 description = "A distributed key-value database"
 license = "Apache-2.0"
 repository = "https://github.com/jkosh44/andross"
 
-[dependencies]
+[workspace.dependencies]
+prost = "0.14"
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 
 [workspace.lints.rust]
 
@@ -15,4 +24,4 @@ repository = "https://github.com/jkosh44/andross"
 [workspace.lints.clippy]
 cargo = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-restriction = { level = "warn", priority = -1 }
+multiple_crate_versions = { level = "allow", priority = 0 }
