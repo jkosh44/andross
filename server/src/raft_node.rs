@@ -9,7 +9,8 @@ use andross_service::kv::kv_service_server::KvService;
 use andross_service::kv::raft_service_client::RaftServiceClient;
 use andross_service::kv::raft_service_server::RaftService;
 use andross_service::kv::{CommandRequest, CommandResponse, MessageRequest, MessageResponse};
-use protobuf::Message as ProtobufMessage;
+use itertools::Itertools;
+use protobuf::{Message as ProtobufMessage, ProtobufResult};
 use raft::prelude::{ConfState, Entry};
 use raft::{Config, RawNode};
 use std::collections::HashMap;
@@ -25,7 +26,7 @@ const RAFT_TIMEOUT: Duration = Duration::from_millis(100);
 
 enum Message {
     Command(Vec<u8>),
-    RaftMessage(raft::prelude::Message),
+    RaftMessages(Vec<raft::prelude::Message>),
 }
 
 pub struct Node<T: Storage> {
@@ -77,8 +78,10 @@ impl<T: Storage> Node<T> {
             select! {
                 message = self.rx.recv() => {
                     match message {
-                        Some(Message::RaftMessage(message)) => {
-                            self.raft_group.step(message)?;
+                        Some(Message::RaftMessages(messages)) => {
+                            for message in messages {
+                                self.raft_group.step(message)?;
+                            }
                             self.on_ready().await?;
                         }
                         Some(Message::Command(data)) => {
@@ -156,17 +159,26 @@ impl<T: Storage> Node<T> {
     }
 
     async fn handle_messages(&mut self, messages: Vec<raft::prelude::Message>) -> Result<()> {
-        // TODO: Support sending batches of messages.
-        for message in messages {
-            let to = message.get_to();
-            let peer = self
+        let messages = messages
+            .into_iter()
+            .into_group_map_by(raft::prelude::Message::get_to);
+        let mut peer_futures = Vec::with_capacity(messages.len());
+        for (to, messages) in messages {
+            let mut peer = self
                 .peers
-                .get_mut(&to)
+                .remove(&to)
                 .ok_or_else(|| format!("unknown peer: {to}"))?;
-
-            // Ignore errors, messages are retried if they need to be.
-            let _ = peer.send_message(message).await;
+            let future = async move {
+                // We can ignore errors, Raft will retry messages if it's necessary.
+                // TODO: Debug or trace this once logging is set up.
+                let _result = peer.send_messages(messages).await;
+                (to, peer)
+            };
+            peer_futures.push(future);
         }
+        let peers = futures::future::join_all(peer_futures).await;
+        self.peers.extend(peers.into_iter());
+
         Ok(())
     }
 
@@ -205,11 +217,14 @@ impl RaftService for NodeHandle {
         &self,
         request: Request<MessageRequest>,
     ) -> std::result::Result<Response<MessageResponse>, Status> {
-        let MessageRequest { message } = request.into_inner();
-        let message = raft::prelude::Message::parse_from_bytes(&message)
+        let MessageRequest { messages_bytes } = request.into_inner();
+        let messages = messages_bytes
+            .into_iter()
+            .map(|message_bytes| raft::prelude::Message::parse_from_bytes(&message_bytes))
+            .collect::<ProtobufResult<Vec<_>>>()
             .map_err(|_| Status::invalid_argument("Failed to parse raft message"))?;
         self.tx
-            .send(Message::RaftMessage(message))
+            .send(Message::RaftMessages(messages))
             .map_err(|_| Status::unavailable("Server is shutting down"))?;
         Ok(Response::new(MessageResponse {}))
     }
@@ -225,18 +240,21 @@ impl PeerClient {
         Self { addr, client: None }
     }
 
-    async fn send_message(&mut self, message: raft::prelude::Message) -> Result<()> {
+    async fn send_messages(&mut self, messages: Vec<raft::prelude::Message>) -> Result<()> {
         let client = if let Some(client) = &mut self.client {
             client
         } else {
             let new_client = RaftServiceClient::connect(self.addr.clone()).await?;
             self.client.insert(new_client)
         };
-        let message_bytes = message.write_to_bytes()?;
+
+        let messages_bytes = messages
+            .into_iter()
+            .map(|message| message.write_to_bytes())
+            .collect::<ProtobufResult<Vec<_>>>()?;
+
         client
-            .message(Request::new(MessageRequest {
-                message: message_bytes,
-            }))
+            .message(Request::new(MessageRequest { messages_bytes }))
             .await?;
         Ok(())
     }

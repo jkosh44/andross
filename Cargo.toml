@@ -12,6 +12,8 @@ repository = "https://github.com/jkosh44/andross"
 
 [workspace.dependencies]
 clap = "4.5"
+futures = "0.3"
+itertools = "0.14"
 prost = "0.14"
 protobuf = "2"
 raft = { git = "https://github.com/tikv/raft-rs.git", rev = "1fd05e000fb094015507c5c985849d370100fb72" }

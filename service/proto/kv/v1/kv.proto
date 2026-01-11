@@ -16,8 +16,8 @@ message CommandRequest {
 message CommandResponse {}
 
 message MessageRequest {
-  // Serialized raft message.
-  bytes message = 1;
+  // Serialized raft messages.
+  repeated bytes messages_bytes = 1;
 }
 
 message MessageResponse {}
