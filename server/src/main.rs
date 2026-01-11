@@ -19,6 +19,11 @@ struct Args {
     #[arg(long, value_parser = parse_peer)]
     peers: Vec<(u64, String)>,
 
+    /// How often to advance the internal clock of the Raft node.
+    #[arg(long, default_value = "100ms", value_parser = humantime::parse_duration)]
+    raft_tick_interval: Duration,
+
+    /// The default timeout of requests, if no timeout is specified for the request.
     #[arg(long, default_value = "100ms", value_parser = humantime::parse_duration)]
     default_request_timeout: Duration,
 }
@@ -43,6 +48,7 @@ async fn main() -> Result<()> {
         id: args.id,
         addr_config: AddrConfig::Port(args.port),
         peers,
+        raft_tick_interval: args.raft_tick_interval,
         default_request_timeout: args.default_request_timeout,
         cancellation_token: CancellationToken::new(),
     };
