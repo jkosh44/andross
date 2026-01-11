@@ -6,6 +6,8 @@ use clap::Parser;
 use raft::storage::MemStorage;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::select;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
 #[derive(Parser)]
@@ -50,16 +52,32 @@ async fn main() -> Result<()> {
     let (node, node_handle) =
         initialize::<MemStorage>(args.id, peers, args.default_request_timeout).await?;
 
-    // TODO: Add way to shutdown the node.
-    let _node_task_handle = tokio::spawn(async move {
-        let result = node.run().await;
-        println!("SEVER RESULT: {result:?}");
+    let cancellation_token = CancellationToken::new();
+    let node_cancellation_token = cancellation_token.clone();
+    let server_cancellation_toke = cancellation_token.clone();
+    let mut node_task_handle = tokio::spawn(async move { node.run(node_cancellation_token).await });
+    let mut server_task_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(RaftServiceServer::new(node_handle.clone()))
+            .add_service(KvServiceServer::new(node_handle))
+            .serve_with_shutdown(addr, server_cancellation_toke.cancelled())
+            .await
     });
-    Server::builder()
-        .add_service(RaftServiceServer::new(node_handle.clone()))
-        .add_service(KvServiceServer::new(node_handle))
-        .serve(addr)
-        .await?;
+
+    select! {
+        node_result = &mut node_task_handle => {
+            cancellation_token.cancel();
+            let server_result = server_task_handle.await.expect("task panicked");
+            node_result.expect("node task panicked")?;
+            server_result?;
+        },
+        server_result = &mut server_task_handle => {
+            cancellation_token.cancel();
+            let node_result = node_task_handle.await.expect("task panicked");
+            server_result.expect("node task panicked")?;
+            node_result?;
+        },
+    }
 
     Ok(())
 }
