@@ -1,5 +1,6 @@
 use andross_service::kv::CommandRequest;
 use andross_service::kv::kv_service_client::KvServiceClient;
+use bytes::Bytes;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -17,7 +18,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let data = args.command.into_bytes();
+    let data = Bytes::from(args.command.into_bytes());
 
     for addr in args.addrs {
         match send_request(addr, data.clone()).await {
@@ -27,7 +28,7 @@ async fn main() {
     }
 }
 
-async fn send_request(addr: String, data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+async fn send_request(addr: String, data: Bytes) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = KvServiceClient::connect(format!("http://{addr}")).await?;
     let request = tonic::Request::new(CommandRequest { data });
     let response = client.command(request).await?;

@@ -25,6 +25,7 @@ name = "andross-client"
 version = "0.1.0"
 dependencies = [
  "andross-service",
+ "bytes",
  "clap",
  "tokio",
  "tonic",
@@ -35,6 +36,7 @@ name = "andross-server"
 version = "0.1.0"
 dependencies = [
  "andross-service",
+ "bytes",
  "clap",
  "futures",
  "itertools",

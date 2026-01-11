@@ -9,6 +9,7 @@ use andross_service::kv::kv_service_server::KvService;
 use andross_service::kv::raft_service_client::RaftServiceClient;
 use andross_service::kv::raft_service_server::RaftService;
 use andross_service::kv::{CommandRequest, CommandResponse, MessageRequest, MessageResponse};
+use bytes::Bytes;
 use itertools::Itertools;
 use protobuf::{Message as ProtobufMessage, ProtobufResult};
 use raft::prelude::{ConfState, Entry};
@@ -25,7 +26,7 @@ use tonic::{Request, Response, Status};
 const RAFT_TIMEOUT: Duration = Duration::from_millis(100);
 
 enum Message {
-    Command(Vec<u8>),
+    Command(Bytes),
     RaftMessages(Vec<raft::prelude::Message>),
 }
 
@@ -85,7 +86,9 @@ impl<T: Storage> Node<T> {
                             self.on_ready().await?;
                         }
                         Some(Message::Command(data)) => {
-                            match self.raft_group.propose(Vec::new(), data) {
+                            // TODO: This is an unfortunate copy of `data`, there are no other
+                            // references to the underlying bytes.
+                            match self.raft_group.propose(Vec::new(), data.to_vec()) {
                                 Ok(()) => {
                                     self.on_ready().await?;
                                 }
@@ -220,7 +223,9 @@ impl RaftService for NodeHandle {
         let MessageRequest { messages_bytes } = request.into_inner();
         let messages = messages_bytes
             .into_iter()
-            .map(|message_bytes| raft::prelude::Message::parse_from_bytes(&message_bytes))
+            .map(|message_bytes| {
+                raft::prelude::Message::parse_from_carllerche_bytes(&message_bytes)
+            })
             .collect::<ProtobufResult<Vec<_>>>()
             .map_err(|_| Status::invalid_argument("Failed to parse raft message"))?;
         self.tx
@@ -250,7 +255,7 @@ impl PeerClient {
 
         let messages_bytes = messages
             .into_iter()
-            .map(|message| message.write_to_bytes())
+            .map(|message| message.write_to_bytes().map(Bytes::from))
             .collect::<ProtobufResult<Vec<_>>>()?;
 
         client
