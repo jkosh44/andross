@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
@@ -89,7 +90,7 @@ impl<T: Storage> Node<T> {
     /// # Errors
     ///
     /// Returns an error if Raft processing fails.
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(mut self, cancellation_token: CancellationToken) -> Result<()> {
         let mut timeout = RAFT_TIMEOUT;
         loop {
             let start = Instant::now();
@@ -172,6 +173,8 @@ impl<T: Storage> Node<T> {
                     }
                     timeout = RAFT_TIMEOUT;
                 }
+
+                () = cancellation_token.cancelled() => break,
             }
         }
 

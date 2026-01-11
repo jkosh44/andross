@@ -16,6 +16,7 @@ itertools = { workspace = true }
 protobuf = { workspace = true }
 raft = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tonic = { workspace = true }
 
 [lints]

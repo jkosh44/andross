@@ -44,6 +44,7 @@ dependencies = [
  "protobuf",
  "raft",
  "tokio",
+ "tokio-util",
  "tonic",
 ]
 
