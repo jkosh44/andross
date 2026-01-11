@@ -2,6 +2,7 @@ use andross_server::{AddrConfig, AndrossConfig, start_server};
 use andross_service::kv::CommandRequest;
 use andross_service::kv::kv_service_client::KvServiceClient;
 use andross_service::parse_uri;
+use raft::storage::MemStorage;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -53,6 +54,7 @@ async fn test_three_node_cluster() {
             peers,
             raft_tick_interval: Duration::from_millis(1),
             default_request_timeout: Duration::from_secs(5),
+            log_storage: MemStorage::new(),
             cancellation_token: cancellation_token.clone(),
         };
 

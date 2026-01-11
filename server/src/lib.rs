@@ -3,10 +3,10 @@
 //! This crate provides the core server logic for the Andross distributed key-value store,
 //! including the Raft consensus protocol implementation and storage abstractions.
 
+use crate::log_storage::LogStorage;
 use crate::raft_node::initialize;
 use andross_service::kv::kv_service_server::KvServiceServer;
 use andross_service::kv::raft_service_server::RaftServiceServer;
-use raft::storage::MemStorage;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -15,17 +15,19 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, Uri};
 
+pub mod log_storage;
 pub mod raft_node;
-pub mod storage;
+pub(crate) mod util;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-pub struct AndrossConfig {
+pub struct AndrossConfig<T: LogStorage> {
     pub id: u64,
     pub addr_config: AddrConfig,
     pub peers: HashMap<u64, Uri>,
     pub raft_tick_interval: Duration,
     pub default_request_timeout: Duration,
+    pub log_storage: T,
     pub cancellation_token: CancellationToken,
 }
 
@@ -42,18 +44,25 @@ pub enum AddrConfig {
 /// # Errors
 ///
 /// Returns an error if the configuration is invalid or if the server could not be started.
-pub async fn start_server(
+pub async fn start_server<T: LogStorage + Send + 'static>(
     AndrossConfig {
         id,
         addr_config,
         peers,
         raft_tick_interval,
         default_request_timeout,
+        log_storage,
         cancellation_token,
-    }: AndrossConfig,
+    }: AndrossConfig<T>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let (node, node_handle) =
-        initialize::<MemStorage>(id, peers, raft_tick_interval, default_request_timeout).await?;
+    let (node, node_handle) = initialize(
+        id,
+        peers,
+        raft_tick_interval,
+        default_request_timeout,
+        log_storage,
+    )
+    .await?;
 
     let node_cancellation_token = cancellation_token.clone();
     let server_cancellation_toke = cancellation_token.clone();
