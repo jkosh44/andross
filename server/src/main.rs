@@ -5,6 +5,7 @@ use andross_service::kv::raft_service_server::RaftServiceServer;
 use clap::Parser;
 use raft::storage::MemStorage;
 use std::collections::HashMap;
+use std::time::Duration;
 use tonic::transport::Server;
 
 #[derive(Parser)]
@@ -21,6 +22,9 @@ struct Args {
     /// Map of node IDs to hostnames and ports (e.g., 1=localhost:42667).
     #[arg(long, value_parser = parse_peer)]
     peers: Vec<(u64, String)>,
+
+    #[arg(long, default_value = "100ms", value_parser = humantime::parse_duration)]
+    default_request_timeout: Duration,
 }
 
 fn parse_peer(s: &str) -> std::result::Result<(u64, String), String> {
@@ -43,7 +47,8 @@ async fn main() -> Result<()> {
 
     let peers: HashMap<u64, String> = args.peers.into_iter().collect();
 
-    let (node, node_handle) = initialize::<MemStorage>(args.id, peers).await?;
+    let (node, node_handle) =
+        initialize::<MemStorage>(args.id, peers, args.default_request_timeout).await?;
 
     // TODO: Add way to shutdown the node.
     let _node_task_handle = tokio::spawn(async move {
