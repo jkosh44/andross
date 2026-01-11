@@ -1,8 +1,11 @@
 syntax = "proto3";
 package service.proto.kv.v1;
 
-service RaftService {
+service KvService {
   rpc Command(CommandRequest) returns (CommandResponse);
+}
+
+service RaftService {
   rpc Message(MessageRequest) returns (MessageResponse);
 }
 
@@ -12,6 +15,9 @@ message CommandRequest {
 
 message CommandResponse {}
 
-message MessageRequest {}
+message MessageRequest {
+  // Serialized raft message.
+  bytes message = 1;
+}
 
 message MessageResponse {}

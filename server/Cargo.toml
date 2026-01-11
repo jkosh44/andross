@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 andross-service = { path = "../service" }
 clap = { workspace = true, features = ["derive"] }
+protobuf = { workspace = true }
 raft = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

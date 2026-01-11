@@ -5,38 +5,42 @@
 
 use crate::Result;
 use crate::storage::Storage;
+use andross_service::kv::kv_service_server::KvService;
+use andross_service::kv::raft_service_client::RaftServiceClient;
 use andross_service::kv::raft_service_server::RaftService;
 use andross_service::kv::{CommandRequest, CommandResponse, MessageRequest, MessageResponse};
+use protobuf::Message as ProtobufMessage;
 use raft::prelude::{ConfState, Entry};
 use raft::{Config, RawNode};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::sync::mpsc;
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
-// TODO: This seems too high, this is basically the lower bound on write latency.
+// TODO: This seems too high.
 /// Timeout in-between Raft ticks.
 const RAFT_TIMEOUT: Duration = Duration::from_millis(100);
 
 enum Message {
     Command(Vec<u8>),
-    #[expect(dead_code)]
     RaftMessage(raft::prelude::Message),
 }
 
 pub struct Node<T: Storage> {
     raft_group: RawNode<T>,
     rx: mpsc::UnboundedReceiver<Message>,
+    peers: HashMap<u64, PeerClient>,
 }
 
 impl<T: Storage> Node<T> {
     async fn new(
         id: u64,
-        peers: HashSet<u64>,
+        peers: HashMap<u64, String>,
         rx: mpsc::UnboundedReceiver<Message>,
     ) -> Result<Self> {
-        let voters = std::iter::once(id).chain(peers.iter().copied()).collect();
+        let voters = std::iter::once(id).chain(peers.keys().copied()).collect();
         let conf_state = ConfState {
             voters,
             ..ConfState::default()
@@ -44,9 +48,16 @@ impl<T: Storage> Node<T> {
         let storage = T::init(conf_state).await;
         let config = Config::new(id);
         let raft = RawNode::with_default_logger(&config, storage)?;
+
+        let peers = peers
+            .into_iter()
+            .map(|(id, addr)| (id, PeerClient::new(addr)))
+            .collect();
+
         Ok(Self {
             raft_group: raft,
             rx,
+            peers,
         })
     }
 
@@ -64,14 +75,17 @@ impl<T: Storage> Node<T> {
             let start = Instant::now();
 
             select! {
-                msg = self.rx.recv() => {
-                    match msg {
-                        Some(Message::RaftMessage(msg)) => {
-                            self.raft_group.step(msg)?;
+                message = self.rx.recv() => {
+                    match message {
+                        Some(Message::RaftMessage(message)) => {
+                            self.raft_group.step(message)?;
+                            self.on_ready().await?;
                         }
                         Some(Message::Command(data)) => {
                             match self.raft_group.propose(Vec::new(), data) {
-                                Ok(()) => {}
+                                Ok(()) => {
+                                    self.on_ready().await?;
+                                }
                                 Err(e) => {
                                     // TODO: Handle errors.
                                     println!("PROPOSE ERROR: {e:?}");
@@ -86,9 +100,6 @@ impl<T: Storage> Node<T> {
 
                 () = tokio::time::sleep(timeout) => {
                     if self.raft_group.tick() {
-                        // TODO: We may also want to check on_ready when receiving messages or
-                        // command data. That might lessen the amount of batching, but decreases
-                        // latency for individual requests.
                         self.on_ready().await?;
                     }
                     timeout = RAFT_TIMEOUT;
@@ -99,16 +110,18 @@ impl<T: Storage> Node<T> {
         Ok(())
     }
 
+    // TODO: When do we actually want to call this? Does calling it after every message reduce
+    // batching?
     async fn on_ready(&mut self) -> Result<()> {
         if !self.raft_group.has_ready() {
             return Ok(());
         }
 
         let mut ready = self.raft_group.ready();
-        let store = self.raft_group.raft.raft_log.store();
 
         // Handle ready tasks.
         self.handle_messages(ready.take_messages()).await?;
+        let store = self.raft_group.raft.raft_log.store();
         if !ready.snapshot().is_empty() {
             unimplemented!("snapshots are not yet supported");
         }
@@ -142,10 +155,17 @@ impl<T: Storage> Node<T> {
         Ok(())
     }
 
-    #[expect(clippy::unused_async)]
-    async fn handle_messages(&self, msgs: Vec<raft::prelude::Message>) -> Result<()> {
-        for _msg in msgs {
-            todo!()
+    async fn handle_messages(&mut self, messages: Vec<raft::prelude::Message>) -> Result<()> {
+        // TODO: Support sending batches of messages.
+        for message in messages {
+            let to = message.get_to();
+            let peer = self
+                .peers
+                .get_mut(&to)
+                .ok_or_else(|| format!("unknown peer: {to}"))?;
+
+            // Ignore errors, messages are retried if they need to be.
+            let _ = peer.send_message(message).await;
         }
         Ok(())
     }
@@ -160,12 +180,13 @@ impl<T: Storage> Node<T> {
     }
 }
 
+#[derive(Clone)]
 pub struct NodeHandle {
     tx: mpsc::UnboundedSender<Message>,
 }
 
 #[tonic::async_trait]
-impl RaftService for NodeHandle {
+impl KvService for NodeHandle {
     async fn command(
         &self,
         request: Request<CommandRequest>,
@@ -176,13 +197,48 @@ impl RaftService for NodeHandle {
             .map_err(|_| Status::unavailable("Server is shutting down"))?;
         Ok(Response::new(CommandResponse {}))
     }
+}
 
+#[tonic::async_trait]
+impl RaftService for NodeHandle {
     async fn message(
         &self,
-        _request: Request<MessageRequest>,
+        request: Request<MessageRequest>,
     ) -> std::result::Result<Response<MessageResponse>, Status> {
-        // TODO: implement
-        unimplemented!()
+        let MessageRequest { message } = request.into_inner();
+        let message = raft::prelude::Message::parse_from_bytes(&message)
+            .map_err(|_| Status::invalid_argument("Failed to parse raft message"))?;
+        self.tx
+            .send(Message::RaftMessage(message))
+            .map_err(|_| Status::unavailable("Server is shutting down"))?;
+        Ok(Response::new(MessageResponse {}))
+    }
+}
+
+struct PeerClient {
+    addr: String,
+    client: Option<RaftServiceClient<Channel>>,
+}
+
+impl PeerClient {
+    fn new(addr: String) -> Self {
+        Self { addr, client: None }
+    }
+
+    async fn send_message(&mut self, message: raft::prelude::Message) -> Result<()> {
+        let client = if let Some(client) = &mut self.client {
+            client
+        } else {
+            let new_client = RaftServiceClient::connect(self.addr.clone()).await?;
+            self.client.insert(new_client)
+        };
+        let message_bytes = message.write_to_bytes()?;
+        client
+            .message(Request::new(MessageRequest {
+                message: message_bytes,
+            }))
+            .await?;
+        Ok(())
     }
 }
 
@@ -191,7 +247,10 @@ impl RaftService for NodeHandle {
 /// # Errors
 ///
 /// Returns an error if the Raft node fails to initialize.
-pub async fn initialize<T: Storage>(id: u64, peers: HashSet<u64>) -> Result<(Node<T>, NodeHandle)> {
+pub async fn initialize<T: Storage>(
+    id: u64,
+    peers: HashMap<u64, String>,
+) -> Result<(Node<T>, NodeHandle)> {
     let (tx, rx) = mpsc::unbounded_channel();
     let node = Node::new(id, peers, rx).await?;
     let node_handle = NodeHandle { tx };
