@@ -1,14 +1,8 @@
-use andross_server::Result;
-use andross_server::raft_node::initialize;
-use andross_service::kv::kv_service_server::KvServiceServer;
-use andross_service::kv::raft_service_server::RaftServiceServer;
+use andross_server::{AddrConfig, AndrossConfig, Result, start_server};
 use clap::Parser;
-use raft::storage::MemStorage;
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::select;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -44,40 +38,16 @@ fn parse_peer(s: &str) -> std::result::Result<(u64, String), String> {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let port = args.port;
-    let addr = format!("[::1]:{port}").parse()?;
-
     let peers: HashMap<u64, String> = args.peers.into_iter().collect();
+    let config = AndrossConfig {
+        id: args.id,
+        addr_config: AddrConfig::Port(args.port),
+        peers,
+        default_request_timeout: args.default_request_timeout,
+        cancellation_token: CancellationToken::new(),
+    };
 
-    let (node, node_handle) =
-        initialize::<MemStorage>(args.id, peers, args.default_request_timeout).await?;
-
-    let cancellation_token = CancellationToken::new();
-    let node_cancellation_token = cancellation_token.clone();
-    let server_cancellation_toke = cancellation_token.clone();
-    let mut node_task_handle = tokio::spawn(async move { node.run(node_cancellation_token).await });
-    let mut server_task_handle = tokio::spawn(async move {
-        Server::builder()
-            .add_service(RaftServiceServer::new(node_handle.clone()))
-            .add_service(KvServiceServer::new(node_handle))
-            .serve_with_shutdown(addr, server_cancellation_toke.cancelled())
-            .await
-    });
-
-    select! {
-        node_result = &mut node_task_handle => {
-            cancellation_token.cancel();
-            let server_result = server_task_handle.await.expect("task panicked");
-            node_result.expect("node task panicked")?;
-            server_result?;
-        },
-        server_result = &mut server_task_handle => {
-            cancellation_token.cancel();
-            let node_result = node_task_handle.await.expect("task panicked");
-            server_result.expect("node task panicked")?;
-            node_result?;
-        },
-    }
+    start_server(config).await?.await??;
 
     Ok(())
 }
