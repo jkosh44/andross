@@ -17,7 +17,7 @@ use raft::{Config, RawNode};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::select;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
@@ -26,20 +26,34 @@ use tonic::{Request, Response, Status};
 const RAFT_TIMEOUT: Duration = Duration::from_millis(100);
 
 enum Message {
-    Command(Bytes),
+    Command {
+        data: Bytes,
+        response_tx: oneshot::Sender<std::result::Result<(), Status>>,
+    },
+    CommandTimeout {
+        command_id: u64,
+    },
     RaftMessages(Vec<raft::prelude::Message>),
 }
 
 pub struct Node<T: Storage> {
     raft_group: RawNode<T>,
-    rx: mpsc::UnboundedReceiver<Message>,
     peers: HashMap<u64, PeerClient>,
+
+    next_command_id: u64,
+    pending_commands: HashMap<u64, oneshot::Sender<std::result::Result<(), Status>>>,
+    default_request_timeout: Duration,
+
+    tx: mpsc::UnboundedSender<Message>,
+    rx: mpsc::UnboundedReceiver<Message>,
 }
 
 impl<T: Storage> Node<T> {
     async fn new(
         id: u64,
         peers: HashMap<u64, String>,
+        default_request_timeout: Duration,
+        tx: mpsc::UnboundedSender<Message>,
         rx: mpsc::UnboundedReceiver<Message>,
     ) -> Result<Self> {
         let voters = std::iter::once(id).chain(peers.keys().copied()).collect();
@@ -58,8 +72,12 @@ impl<T: Storage> Node<T> {
 
         Ok(Self {
             raft_group: raft,
-            rx,
             peers,
+            next_command_id: u64::MIN,
+            pending_commands: HashMap::new(),
+            default_request_timeout,
+            tx,
+            rx,
         })
     }
 
@@ -85,19 +103,63 @@ impl<T: Storage> Node<T> {
                             }
                             self.on_ready().await?;
                         }
-                        Some(Message::Command(data)) => {
+                        Some(Message::Command{ data, response_tx }) => {
+                            let command_context = self.allocate_command_context()?;
+                            let command_id = command_context.command_id;
+
                             // TODO: This is an unfortunate copy of `data`, there are no other
                             // references to the underlying bytes.
-                            match self.raft_group.propose(Vec::new(), data.to_vec()) {
+                            match self.raft_group.propose(command_context.into_bytes(), data.to_vec()) {
                                 Ok(()) => {
+                                    let previous = self.pending_commands.insert(command_id, response_tx);
+                                    assert!(previous.is_none(), "command ID reuse");
+                                    let request_timeout = self.default_request_timeout;
+                                    let tx = self.tx.clone();
+                                    // An accepted proposal does not mean that the command will be
+                                    // committed, so we eventually have to time it out. This avoids
+                                    // memory leaks in `pending_commands` and prevents clients from
+                                    // waiting around forever if the command will never commit.
+                                    //
+                                    // It's tempting to not have any timeout and rely only on
+                                    // clients to timeout requests when they're tired of waiting.
+                                    // However, if this node is not a leader, then it has no way of
+                                    // even knowing if the proposal was received and accepted by the
+                                    // leader. It's possible that the network message was dropped
+                                    // and we'll wait forever. We also can't blindly retry because
+                                    // we don't know if the command is idempotent. So we must
+                                    // eventually time a command out or requests will wait on
+                                    // dropped proposals forever.
+                                    //
+                                    // If we disable proposal forwarding (followers forwarding
+                                    // proposals to leaders), then we know that the proposal will
+                                    // only be accepted by leaders and will get written down to the
+                                    // leaders log. We could detect when/if that log entry was
+                                    // truncated and abort the request without needing a timeout.
+                                    // Unfortunately, that doesn't seem possible to do with the
+                                    // current Raft library.
+                                    //
+                                    // Other similar systems abort all in-flight requests when the
+                                    // term changes.
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(request_timeout).await;
+                                        // Ignore errors if the server is shutting down.
+                                        let _ = tx.send(Message::CommandTimeout { command_id });
+                                    });
+
                                     self.on_ready().await?;
                                 }
                                 Err(e) => {
-                                    // TODO: Handle errors.
-                                    println!("PROPOSE ERROR: {e:?}");
+                                    // Ignore errors if the client has hung up.
+                                    let _ = response_tx.send(Err(Status::failed_precondition(e.to_string())));
                                 },
                             }
 
+                        }
+                        Some(Message::CommandTimeout{ command_id }) => {
+                            if let Some(response_tx) = self.pending_commands.remove(&command_id) {
+                                // This is an indeterminate error, the command may still succeed.
+                                let _ = response_tx.send(Err(Status::deadline_exceeded("indeterminate error, command timed out")));
+                            }
                         }
                         None => break,
                     }
@@ -127,17 +189,16 @@ impl<T: Storage> Node<T> {
 
         // Handle ready tasks.
         self.handle_messages(ready.take_messages()).await?;
-        let store = self.raft_group.raft.raft_log.store();
         if !ready.snapshot().is_empty() {
             unimplemented!("snapshots are not yet supported");
         }
         self.handle_committed_entries(ready.take_committed_entries())
             .await?;
         if !ready.entries().is_empty() {
-            store.append(ready.entries()).await?;
+            self.store().append(ready.entries()).await?;
         }
         if let Some(hard_state) = ready.hs() {
-            store.set_hard_state(hard_state.clone()).await;
+            self.store().set_hard_state(hard_state.clone()).await;
         }
         self.handle_messages(ready.take_persisted_messages())
             .await?;
@@ -145,11 +206,9 @@ impl<T: Storage> Node<T> {
         // Advance the Raft state machine.
         let mut light_ready = self.raft_group.advance(ready);
 
-        let store = self.raft_group.raft.raft_log.store();
-
         // Handle light-ready tasks.
         if let Some(commit_index) = light_ready.commit_index() {
-            store.set_commit_index(commit_index).await;
+            self.store().set_commit_index(commit_index).await;
         }
         self.handle_messages(light_ready.take_messages()).await?;
         self.handle_committed_entries(light_ready.take_committed_entries())
@@ -186,12 +245,33 @@ impl<T: Storage> Node<T> {
     }
 
     #[expect(clippy::unused_async)]
-    async fn handle_committed_entries(&self, committed_entries: Vec<Entry>) -> Result<()> {
+    async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) -> Result<()> {
         for entry in committed_entries {
             // TODO: Actually apply the entry.
+            let command_context = CommandContext::from_bytes(&entry.context);
+            if let Ok(command_context) = command_context
+                && command_context.node_id == self.raft_group.raft.id
+                && let Some(response_tx) = self.pending_commands.remove(&command_context.command_id)
+            {
+                // Ignore errors if the client has hung up.
+                let _ = response_tx.send(Ok(()));
+            }
             println!("COMMITTED: {entry:?}");
         }
         Ok(())
+    }
+
+    fn allocate_command_context(&mut self) -> Result<CommandContext> {
+        let command_id = self.next_command_id;
+        self.next_command_id = self
+            .next_command_id
+            .checked_add(1)
+            .ok_or("command ID overflow")?;
+        Ok(CommandContext::new(self.raft_group.raft.id, command_id))
+    }
+
+    fn store(&self) -> &T {
+        self.raft_group.raft.raft_log.store()
     }
 }
 
@@ -207,10 +287,15 @@ impl KvService for NodeHandle {
         request: Request<CommandRequest>,
     ) -> std::result::Result<Response<CommandResponse>, Status> {
         let CommandRequest { data } = request.into_inner();
+        let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(Message::Command(data))
+            .send(Message::Command { data, response_tx })
             .map_err(|_| Status::unavailable("Server is shutting down"))?;
-        Ok(Response::new(CommandResponse {}))
+        match response_rx.await {
+            Ok(Ok(())) => Ok(Response::new(CommandResponse {})),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Status::unavailable("Server is shutting down")),
+        }
     }
 }
 
@@ -265,6 +350,39 @@ impl PeerClient {
     }
 }
 
+struct CommandContext {
+    node_id: u64,
+    command_id: u64,
+}
+
+impl CommandContext {
+    fn new(node_id: u64, command_id: u64) -> Self {
+        Self {
+            node_id,
+            command_id,
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(size_of::<u64>() * 2);
+        bytes.extend_from_slice(&self.node_id.to_le_bytes());
+        bytes.extend_from_slice(&self.command_id.to_le_bytes());
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (node_id_bytes, command_id_bytes) = bytes
+            .split_first_chunk()
+            .ok_or_else(|| format!("invalid command context: {bytes:?}"))?;
+        let node_id = u64::from_le_bytes(*node_id_bytes);
+        let command_id_bytes = command_id_bytes
+            .try_into()
+            .map_err(|_| format!("invalid command context: {bytes:?}"))?;
+        let command_id = u64::from_le_bytes(command_id_bytes);
+        Ok(Self::new(node_id, command_id))
+    }
+}
+
 /// Initializes a new Raft node and returns it along with a handle to interact with it.
 ///
 /// # Errors
@@ -273,9 +391,10 @@ impl PeerClient {
 pub async fn initialize<T: Storage>(
     id: u64,
     peers: HashMap<u64, String>,
+    default_request_timeout: Duration,
 ) -> Result<(Node<T>, NodeHandle)> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let node = Node::new(id, peers, rx).await?;
+    let node = Node::new(id, peers, default_request_timeout, tx.clone(), rx).await?;
     let node_handle = NodeHandle { tx };
     Ok((node, node_handle))
 }

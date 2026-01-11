@@ -11,6 +11,7 @@ andross-service = { path = "../service" }
 bytes = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
+humantime = { workspace = true }
 itertools = { workspace = true }
 protobuf = { workspace = true }
 raft = { workspace = true }

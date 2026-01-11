@@ -14,6 +14,7 @@ repository = "https://github.com/jkosh44/andross"
 bytes = "1.11"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
+humantime = "2.3"
 itertools = "0.14"
 prost = "0.14"
 # This is needed because it's the protobuf library raft uses.
@@ -32,5 +33,6 @@ tonic-prost-build = "0.14"
 cargo = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Allowed lints
-implicit-hasher = { level = "allow", priority = 0 }
-multiple_crate_versions = { level = "allow", priority = 0 }
+implicit-hasher = "allow"
+missing_panics_doc = "allow"
+multiple_crate_versions = "allow"
