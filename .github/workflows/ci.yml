@@ -19,6 +19,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
+      - uses: swatinem/rust-cache@v2
       - uses: arduino/setup-protoc@v3
       - name: clippy
         uses: actions-rs/cargo@v1
@@ -42,6 +43,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
+      - uses: swatinem/rust-cache@v2
       - uses: arduino/setup-protoc@v3
       - name: cargo doc
         uses: actions-rs/cargo@v1
@@ -56,6 +58,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
+      - uses: swatinem/rust-cache@v2
       - name: taplo
         run: |
           cargo install taplo-cli --locked
@@ -80,6 +83,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
+      - uses: swatinem/rust-cache@v2
       - uses: arduino/setup-protoc@v3
       - name: test
         uses: actions-rs/cargo@v1
@@ -95,6 +99,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
+      - uses: swatinem/rust-cache@v2
       - uses: arduino/setup-protoc@v3
       - name: doc tests
         uses: actions-rs/cargo@v1
