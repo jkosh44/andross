@@ -50,6 +50,7 @@ async fn test_three_node_cluster() {
             id: node_id,
             addr_config: AddrConfig::TcpListener(listener),
             peers,
+            raft_tick_interval: Duration::from_millis(1),
             default_request_timeout: Duration::from_secs(5),
             cancellation_token: cancellation_token.clone(),
         };

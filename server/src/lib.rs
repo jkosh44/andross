@@ -24,6 +24,7 @@ pub struct AndrossConfig {
     pub id: u64,
     pub addr_config: AddrConfig,
     pub peers: HashMap<u64, String>,
+    pub raft_tick_interval: Duration,
     pub default_request_timeout: Duration,
     pub cancellation_token: CancellationToken,
 }
@@ -46,11 +47,13 @@ pub async fn start_server(
         id,
         addr_config,
         peers,
+        raft_tick_interval,
         default_request_timeout,
         cancellation_token,
     }: AndrossConfig,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let (node, node_handle) = initialize::<MemStorage>(id, peers, default_request_timeout).await?;
+    let (node, node_handle) =
+        initialize::<MemStorage>(id, peers, raft_tick_interval, default_request_timeout).await?;
 
     let node_cancellation_token = cancellation_token.clone();
     let server_cancellation_toke = cancellation_token.clone();

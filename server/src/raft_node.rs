@@ -22,10 +22,6 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
-// TODO: This seems too high.
-/// Timeout in-between Raft ticks.
-const RAFT_TIMEOUT: Duration = Duration::from_millis(100);
-
 enum Message {
     Command {
         data: Bytes,
@@ -43,6 +39,7 @@ pub struct Node<T: Storage> {
 
     next_command_id: u64,
     pending_commands: HashMap<u64, oneshot::Sender<std::result::Result<(), Status>>>,
+    raft_tick_interval: Duration,
     default_request_timeout: Duration,
 
     tx: mpsc::UnboundedSender<Message>,
@@ -53,6 +50,7 @@ impl<T: Storage> Node<T> {
     async fn new(
         id: u64,
         peers: HashMap<u64, String>,
+        raft_tick_interval: Duration,
         default_request_timeout: Duration,
         tx: mpsc::UnboundedSender<Message>,
         rx: mpsc::UnboundedReceiver<Message>,
@@ -76,6 +74,7 @@ impl<T: Storage> Node<T> {
             peers,
             next_command_id: u64::MIN,
             pending_commands: HashMap::new(),
+            raft_tick_interval,
             default_request_timeout,
             tx,
             rx,
@@ -91,7 +90,7 @@ impl<T: Storage> Node<T> {
     ///
     /// Returns an error if Raft processing fails.
     pub async fn run(mut self, cancellation_token: CancellationToken) -> Result<()> {
-        let mut timeout = RAFT_TIMEOUT;
+        let mut timeout = self.raft_tick_interval;
         loop {
             let start = Instant::now();
 
@@ -171,7 +170,7 @@ impl<T: Storage> Node<T> {
                     if self.raft_group.tick() {
                         self.on_ready().await?;
                     }
-                    timeout = RAFT_TIMEOUT;
+                    timeout = self.raft_tick_interval;
                 }
 
                 () = cancellation_token.cancelled() => break,
@@ -181,44 +180,40 @@ impl<T: Storage> Node<T> {
         Ok(())
     }
 
-    // TODO: When do we actually want to call this? Does calling it after every message reduce
-    // batching?
     async fn on_ready(&mut self) -> Result<()> {
-        if !self.raft_group.has_ready() {
-            return Ok(());
-        }
+        while self.raft_group.has_ready() {
+            let mut ready = self.raft_group.ready();
 
-        let mut ready = self.raft_group.ready();
+            // Handle ready tasks.
+            self.handle_messages(ready.take_messages()).await?;
+            if !ready.snapshot().is_empty() {
+                unimplemented!("snapshots are not yet supported");
+            }
+            self.handle_committed_entries(ready.take_committed_entries())
+                .await?;
+            if !ready.entries().is_empty() {
+                self.store().append(ready.entries()).await?;
+            }
+            if let Some(hard_state) = ready.hs() {
+                self.store().set_hard_state(hard_state.clone()).await;
+            }
+            self.handle_messages(ready.take_persisted_messages())
+                .await?;
 
-        // Handle ready tasks.
-        self.handle_messages(ready.take_messages()).await?;
-        if !ready.snapshot().is_empty() {
-            unimplemented!("snapshots are not yet supported");
-        }
-        self.handle_committed_entries(ready.take_committed_entries())
-            .await?;
-        if !ready.entries().is_empty() {
-            self.store().append(ready.entries()).await?;
-        }
-        if let Some(hard_state) = ready.hs() {
-            self.store().set_hard_state(hard_state.clone()).await;
-        }
-        self.handle_messages(ready.take_persisted_messages())
-            .await?;
+            // Advance the Raft state machine.
+            let mut light_ready = self.raft_group.advance(ready);
 
-        // Advance the Raft state machine.
-        let mut light_ready = self.raft_group.advance(ready);
+            // Handle light-ready tasks.
+            if let Some(commit_index) = light_ready.commit_index() {
+                self.store().set_commit_index(commit_index).await;
+            }
+            self.handle_messages(light_ready.take_messages()).await?;
+            self.handle_committed_entries(light_ready.take_committed_entries())
+                .await?;
 
-        // Handle light-ready tasks.
-        if let Some(commit_index) = light_ready.commit_index() {
-            self.store().set_commit_index(commit_index).await;
+            // Advance the Raft state machine again.
+            self.raft_group.advance_apply();
         }
-        self.handle_messages(light_ready.take_messages()).await?;
-        self.handle_committed_entries(light_ready.take_committed_entries())
-            .await?;
-
-        // Advance the Raft state machine again.
-        self.raft_group.advance_apply();
 
         Ok(())
     }
@@ -395,10 +390,19 @@ impl CommandContext {
 pub async fn initialize<T: Storage>(
     id: u64,
     peers: HashMap<u64, String>,
+    raft_tick_interval: Duration,
     default_request_timeout: Duration,
 ) -> Result<(Node<T>, NodeHandle)> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let node = Node::new(id, peers, default_request_timeout, tx.clone(), rx).await?;
+    let node = Node::new(
+        id,
+        peers,
+        raft_tick_interval,
+        default_request_timeout,
+        tx.clone(),
+        rx,
+    )
+    .await?;
     let node_handle = NodeHandle { tx };
     Ok((node, node_handle))
 }
@@ -421,10 +425,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_node_command() {
-        let (node, node_handle) =
-            initialize::<MemStorage>(1, HashMap::new(), Duration::from_secs(1))
-                .await
-                .unwrap();
+        let (node, node_handle) = initialize::<MemStorage>(
+            1,
+            HashMap::new(),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
 
         let cancellation_token = CancellationToken::new();
         let task_handle = {
