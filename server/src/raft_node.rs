@@ -353,6 +353,7 @@ impl PeerClient {
     }
 }
 
+#[derive(Eq, PartialEq, Debug, Clone)]
 struct CommandContext {
     node_id: u64,
     command_id: u64,
@@ -400,4 +401,56 @@ pub async fn initialize<T: Storage>(
     let node = Node::new(id, peers, default_request_timeout, tx.clone(), rx).await?;
     let node_handle = NodeHandle { tx };
     Ok((node, node_handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use raft::storage::MemStorage;
+
+    proptest! {
+        #[test]
+        fn test_command_context_roundtrip(node_id in any::<u64>(), command_id in any::<u64>()) {
+            let context = CommandContext::new(node_id, command_id);
+            let bytes = context.clone().into_bytes();
+            let deserialized = CommandContext::from_bytes(&bytes).unwrap();
+            assert_eq!(context, deserialized);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_node_command() {
+        let (node, node_handle) =
+            initialize::<MemStorage>(1, HashMap::new(), Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        let cancellation_token = CancellationToken::new();
+        let task_handle = {
+            let cancellation_token = cancellation_token.clone();
+            tokio::spawn(async move {
+                node.run(cancellation_token).await.unwrap();
+            })
+        };
+
+        let data = Bytes::from("hello");
+        for _ in 0..500 {
+            let request = Request::new(CommandRequest { data: data.clone() });
+            match node_handle.command(request).await {
+                Ok(response) => {
+                    assert_eq!(response.into_inner(), CommandResponse {});
+                    cancellation_token.cancel();
+                    task_handle.await.unwrap();
+                    return;
+                }
+                // Not a leader yet, so keep waiting.
+                Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        panic!("test timed out");
+    }
 }
