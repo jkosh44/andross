@@ -1,10 +1,17 @@
 syntax = "proto3";
 package service.proto.kv.v1;
 
-service NoOpService {
-  rpc NoOp(NoOpRequest) returns (NoOpResponse);
+service RaftService {
+  rpc Command(CommandRequest) returns (CommandResponse);
+  rpc Message(MessageRequest) returns (MessageResponse);
 }
 
-message NoOpRequest {}
+message CommandRequest {
+  bytes data = 1;
+}
 
-message NoOpResponse {}
+message CommandResponse {}
+
+message MessageRequest {}
+
+message MessageResponse {}

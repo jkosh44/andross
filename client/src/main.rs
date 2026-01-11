@@ -1,13 +1,28 @@
-use andross_service::kv::NoOpRequest;
-use andross_service::kv::no_op_service_client::NoOpServiceClient;
+use andross_service::kv::CommandRequest;
+use andross_service::kv::raft_service_client::RaftServiceClient;
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// The port to listen on.
+    #[arg(short, long, default_value_t = 42666)]
+    port: u16,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = NoOpServiceClient::connect("http://[::1]:50051").await?;
+    let args = Args::parse();
 
-    let request = tonic::Request::new(NoOpRequest {});
+    let port = args.port;
+    let mut client = RaftServiceClient::connect(format!("http://[::1]:{port}")).await?;
 
-    let response = client.no_op(request).await?;
+    // TODO: Support user defined requests.
+    let request = tonic::Request::new(CommandRequest {
+        data: b"42 666".to_vec(),
+    });
+
+    let response = client.command(request).await?;
 
     println!("RESPONSE={response:?}");
 
