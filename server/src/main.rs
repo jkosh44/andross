@@ -1,8 +1,10 @@
 use andross_server::{AddrConfig, AndrossConfig, Result, start_server};
+use andross_service::parse_uri;
 use clap::Parser;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tonic::transport::Uri;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -17,7 +19,7 @@ struct Args {
 
     /// Map of node IDs to hostnames and ports (e.g., 1=localhost:42667).
     #[arg(long, value_parser = parse_peer)]
-    peers: Vec<(u64, String)>,
+    peers: Vec<(u64, Uri)>,
 
     /// How often to advance the internal clock of the Raft node.
     #[arg(long, default_value = "100ms", value_parser = humantime::parse_duration)]
@@ -28,22 +30,22 @@ struct Args {
     default_request_timeout: Duration,
 }
 
-fn parse_peer(s: &str) -> std::result::Result<(u64, String), String> {
+fn parse_peer(s: &str) -> std::result::Result<(u64, Uri), String> {
     let (id, addr) = s
         .split_once('=')
         .ok_or_else(|| format!("invalid peer format: no `=` found in `{s}`"))?;
     let id = id
         .parse::<u64>()
         .map_err(|e| format!("invalid peer ID: {e}"))?;
-    let addr = format!("http://{addr}");
-    Ok((id, addr))
+    let uri = parse_uri(addr).map_err(|e| format!("invalid peer address: {e}"))?;
+    Ok((id, uri))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let peers: HashMap<u64, String> = args.peers.into_iter().collect();
+    let peers: HashMap<u64, Uri> = args.peers.into_iter().collect();
     let config = AndrossConfig {
         id: args.id,
         addr_config: AddrConfig::Port(args.port),

@@ -1,6 +1,7 @@
 use andross_server::{AddrConfig, AndrossConfig, start_server};
 use andross_service::kv::CommandRequest;
 use andross_service::kv::kv_service_client::KvServiceClient;
+use andross_service::parse_uri;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -31,7 +32,7 @@ async fn test_three_node_cluster() {
         .map(|(idx, listener)| {
             (
                 idx as u64 + 1,
-                format!("http://{}", listener.local_addr().unwrap()),
+                parse_uri(&listener.local_addr().unwrap().to_string()).unwrap(),
             )
         })
         .collect();
@@ -57,9 +58,8 @@ async fn test_three_node_cluster() {
 
         let join_handle = start_server(config).await.unwrap();
 
-        let client = KvServiceClient::connect(format!("http://{addr}"))
-            .await
-            .unwrap();
+        let uri = parse_uri(&addr.to_string()).unwrap();
+        let client = KvServiceClient::connect(uri).await.unwrap();
 
         let server = ServerHandle {
             client,
