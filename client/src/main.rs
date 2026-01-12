@@ -1,5 +1,6 @@
 use andross_service::kv::CommandRequest;
 use andross_service::kv::kv_service_client::KvServiceClient;
+use andross_service::parse_uri;
 use bytes::Bytes;
 use clap::Parser;
 
@@ -29,7 +30,8 @@ async fn main() {
 }
 
 async fn send_request(addr: String, data: Bytes) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = KvServiceClient::connect(format!("http://{addr}")).await?;
+    let uri = parse_uri(&addr)?;
+    let mut client = KvServiceClient::connect(uri).await?;
     let request = tonic::Request::new(CommandRequest { data });
     let response = client.command(request).await?;
     println!("RESPONSE={response:?}");

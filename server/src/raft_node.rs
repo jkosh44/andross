@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Uri};
 use tonic::{Request, Response, Status};
 
 enum Message {
@@ -49,7 +49,7 @@ pub struct Node<T: Storage> {
 impl<T: Storage> Node<T> {
     async fn new(
         id: u64,
-        peers: HashMap<u64, String>,
+        peers: HashMap<u64, Uri>,
         raft_tick_interval: Duration,
         default_request_timeout: Duration,
         tx: mpsc::UnboundedSender<Message>,
@@ -319,12 +319,12 @@ impl RaftService for NodeHandle {
 }
 
 struct PeerClient {
-    addr: String,
+    addr: Uri,
     client: Option<RaftServiceClient<Channel>>,
 }
 
 impl PeerClient {
-    fn new(addr: String) -> Self {
+    fn new(addr: Uri) -> Self {
         Self { addr, client: None }
     }
 
@@ -389,7 +389,7 @@ impl CommandContext {
 /// Returns an error if the Raft node fails to initialize.
 pub async fn initialize<T: Storage>(
     id: u64,
-    peers: HashMap<u64, String>,
+    peers: HashMap<u64, Uri>,
     raft_tick_interval: Duration,
     default_request_timeout: Duration,
 ) -> Result<(Node<T>, NodeHandle)> {

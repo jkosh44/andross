@@ -12,8 +12,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Server, Uri};
 
 pub mod raft_node;
 pub mod storage;
@@ -23,7 +23,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 pub struct AndrossConfig {
     pub id: u64,
     pub addr_config: AddrConfig,
-    pub peers: HashMap<u64, String>,
+    pub peers: HashMap<u64, Uri>,
     pub raft_tick_interval: Duration,
     pub default_request_timeout: Duration,
     pub cancellation_token: CancellationToken,
