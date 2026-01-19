@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 bytes = { workspace = true }
 clap = { workspace = true }
+fjall = { workspace = true }
 futures = { workspace = true }
 humantime = { workspace = true }
 itertools = { workspace = true }
