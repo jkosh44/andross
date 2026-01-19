@@ -1,6 +1,6 @@
-use andross_service::kv::CommandRequest;
-use andross_service::kv::kv_service_client::KvServiceClient;
-use andross_service::parse_uri;
+use andross_server::parse_uri;
+use andross_server::service::CommandRequest;
+use andross_server::service::kv_service_client::KvServiceClient;
 use bytes::Bytes;
 use clap::Parser;
 

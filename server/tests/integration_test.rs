@@ -1,7 +1,6 @@
-use andross_server::{AddrConfig, AndrossConfig, start_server};
-use andross_service::kv::CommandRequest;
-use andross_service::kv::kv_service_client::KvServiceClient;
-use andross_service::parse_uri;
+use andross_server::service::CommandRequest;
+use andross_server::service::kv_service_client::KvServiceClient;
+use andross_server::{AddrConfig, AndrossConfig, parse_uri, start_server};
 use raft::storage::MemStorage;
 use std::collections::HashMap;
 use std::time::Duration;

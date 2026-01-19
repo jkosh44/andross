@@ -24,7 +24,7 @@ dependencies = [
 name = "andross-client"
 version = "0.1.0"
 dependencies = [
- "andross-service",
+ "andross-server",
  "bytes",
  "clap",
  "tokio",
@@ -35,26 +35,18 @@ dependencies = [
 name = "andross-server"
 version = "0.1.0"
 dependencies = [
- "andross-service",
  "bytes",
  "clap",
  "futures",
  "humantime",
  "itertools",
  "proptest",
+ "prost",
  "protobuf",
  "raft",
  "tempfile",
  "tokio",
  "tokio-util",
- "tonic",
-]
-
-[[package]]
-name = "andross-service"
-version = "0.1.0"
-dependencies = [
- "prost",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

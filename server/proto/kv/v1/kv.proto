@@ -1,5 +1,5 @@
 syntax = "proto3";
-package service.proto.kv.v1;
+package server.proto.kv.v1;
 
 service KvService {
   rpc Command(CommandRequest) returns (CommandResponse);
