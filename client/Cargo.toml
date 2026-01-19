@@ -7,7 +7,7 @@ rust-version = { workspace = true }
 publish = false
 
 [dependencies]
-andross-service = { path = "../service" }
+andross-server = { path = "../server" }
 bytes = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

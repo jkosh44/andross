@@ -7,7 +7,6 @@ rust-version = { workspace = true }
 publish = false
 
 [dependencies]
-andross-service = { path = "../service" }
 bytes = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
@@ -19,9 +18,17 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost", "prost"]

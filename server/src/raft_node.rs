@@ -5,10 +5,10 @@
 
 use crate::Result;
 use crate::log_storage::LogStorage;
-use andross_service::kv::kv_service_server::KvService;
-use andross_service::kv::raft_service_client::RaftServiceClient;
-use andross_service::kv::raft_service_server::RaftService;
-use andross_service::kv::{CommandRequest, CommandResponse, MessageRequest, MessageResponse};
+use crate::service::kv_service_server::KvService;
+use crate::service::raft_service_client::RaftServiceClient;
+use crate::service::raft_service_server::RaftService;
+use crate::service::{CommandRequest, CommandResponse, MessageRequest, MessageResponse};
 use bytes::Bytes;
 use itertools::Itertools;
 use protobuf::{Message as ProtobufMessage, ProtobufResult};
