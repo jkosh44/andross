@@ -2,18 +2,20 @@ syntax = "proto3";
 package server.proto.kv.v1;
 
 service KvService {
-  rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc Command(CommandRequest) returns (CommandResponse);
 }
 
 service RaftService {
   rpc Message(MessageRequest) returns (MessageResponse);
 }
 
-message InsertRequest {
-  bytes tuple = 1;
+message CommandRequest {
+  bytes command_bytes = 1;
 }
 
-message InsertResponse {}
+message CommandResponse {
+  optional bytes response_bytes = 1;
+}
 
 message MessageRequest {
   // Serialized raft messages. Ideally we would just import the raft-rs Message proto message and use that here.

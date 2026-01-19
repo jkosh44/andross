@@ -1,6 +1,6 @@
-use andross_server::service::InsertRequest;
 use andross_server::service::kv_service_client::KvServiceClient;
-use andross_server::{AddrConfig, AndrossConfig, Tuple, parse_uri, start_server, test_database};
+use andross_server::service::{CommandRequest, CommandResponse};
+use andross_server::{AddrConfig, AndrossConfig, Command, parse_uri, start_server, test_database};
 use raft::storage::MemStorage;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -76,13 +76,17 @@ async fn test_three_node_cluster() {
 
     // Send an insert to the cluster.
     let mut success = false;
-    for idx in 0..500 {
-        let tuple =
-            Tuple::from_key_value(format!("k{idx}").as_bytes(), format!("v{idx}").as_bytes())
-                .into_bytes();
-        let request = InsertRequest { tuple };
+    let key = b"k0";
+    let value = b"v0";
+    let command_bytes = Command::insert(key, value).into_bytes();
+    for _ in 0..500 {
+        let request = CommandRequest {
+            command_bytes: command_bytes.clone(),
+        };
         for ServerHandle { client, .. } in &mut servers {
-            if client.insert(Request::new(request.clone())).await.is_ok() {
+            if let Ok(response) = client.command(Request::new(request.clone())).await {
+                let CommandResponse { response_bytes } = response.into_inner();
+                assert_eq!(response_bytes, Some(Vec::new().into()));
                 success = true;
                 break;
             }
@@ -97,6 +101,18 @@ async fn test_three_node_cluster() {
         success,
         "At least one node should have accepted the command"
     );
+
+    // Read the value back from all nodes.
+    for ServerHandle { client, .. } in &mut servers {
+        let command_bytes = Command::read(key).into_bytes();
+        let request = CommandRequest { command_bytes };
+        let CommandResponse { response_bytes } = client
+            .command(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response_bytes, Some(value.to_vec().into()));
+    }
 
     for ServerHandle {
         cancellation_token,

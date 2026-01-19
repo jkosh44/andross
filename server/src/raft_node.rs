@@ -3,12 +3,13 @@
 //! This module contains the `Node` struct which manages the Raft state machine
 //! and handles communication with other nodes in the cluster.
 
+use crate::Result;
+use crate::encodings::{Command, CommandInner, CommandKind};
 use crate::log_storage::LogStorage;
 use crate::service::kv_service_server::KvService;
 use crate::service::raft_service_client::RaftServiceClient;
 use crate::service::raft_service_server::RaftService;
-use crate::service::{InsertRequest, InsertResponse, MessageRequest, MessageResponse};
-use crate::{Result, Tuple};
+use crate::service::{CommandRequest, CommandResponse, MessageRequest, MessageResponse};
 use bytes::Bytes;
 use fjall::KeyspaceCreateOptions;
 use itertools::Itertools;
@@ -29,9 +30,9 @@ use tonic::{Request, Response, Status};
 const GLOBAL_KEYSPACE: &str = "andross";
 
 pub enum Message {
-    Insert {
-        tuple: Bytes,
-        response_tx: oneshot::Sender<std::result::Result<(), Status>>,
+    Command {
+        command: Command,
+        response_tx: oneshot::Sender<std::result::Result<Option<Bytes>, Status>>,
     },
     CommandTimeout {
         command_id: u64,
@@ -55,7 +56,7 @@ pub struct Node<T: LogStorage> {
     peers: HashMap<u64, PeerClient>,
 
     next_command_id: u64,
-    pending_commands: HashMap<u64, oneshot::Sender<std::result::Result<(), Status>>>,
+    pending_commands: HashMap<u64, oneshot::Sender<std::result::Result<Option<Bytes>, Status>>>,
     raft_tick_interval: Duration,
     default_request_timeout: Duration,
 
@@ -127,13 +128,20 @@ impl<T: LogStorage> Node<T> {
                             }
                             self.on_ready().await?;
                         }
-                        Some(Message::Insert{ tuple, response_tx }) => {
-                            let command_context = self.allocate_command_context()?;
+                        Some(Message::Command{ command, response_tx }) => {
+                            let command_kind = command.kind();
+                            let command_context = self.allocate_command_context(command_kind)?;
                             let command_id = command_context.command_id;
 
                             // TODO: This is an unfortunate copy of `data`, there are no other
                             // references to the underlying bytes.
-                            match self.raft_group.propose(command_context.into_bytes(), tuple.to_vec()) {
+                            //
+                            // Both writes and reads are replicated by Raft as a simple way to
+                            // linearize all reads and writes. Replication reads through Raft is
+                            // fairly expensive, because we end writing the read down on disk,
+                            // turning every read into a write. Ideally, reads are done outside of
+                            // Raft to avoid this expense.
+                            match self.raft_group.propose(command_context.into_bytes(), command.into_bytes().to_vec()) {
                                 Ok(()) => {
                                     let previous = self.pending_commands.insert(command_id, response_tx);
                                     assert!(previous.is_none(), "command ID reuse");
@@ -268,43 +276,55 @@ impl<T: LogStorage> Node<T> {
 
     async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) -> Result<()> {
         for entry in committed_entries {
-            println!("committed entry: {entry:?}");
-
             if !entry.data.is_empty() {
-                let tuple = Tuple::new(entry.data)?;
-                let (key, value) = tuple.to_key_value();
+                let command = Command::new(entry.data)?;
                 let db = self.db.clone();
-                let join_handle: JoinHandle<Result<()>> = spawn_blocking(move || {
+                let join_handle: JoinHandle<Result<Option<Bytes>>> = spawn_blocking(move || {
                     // Raft log is what provides durability, not the LSM tree. Any writes that are
                     // not persisted will be replayed from the Raft log.
                     let create_options =
                         KeyspaceCreateOptions::default().manual_journal_persist(true);
                     let items = db.keyspace(GLOBAL_KEYSPACE, || create_options)?;
-                    items.insert(key.as_ref(), value.as_ref())?;
-                    Ok(())
+                    let response = match command.command_inner {
+                        CommandInner::Insert { tuple } => {
+                            let (key, value) = tuple.to_key_value();
+                            items.insert(key.as_ref(), value.as_ref())?;
+                            Some(Bytes::new())
+                        }
+                        CommandInner::Read { key } => {
+                            let value = items.get(key)?;
+                            value.map(|value| value.to_vec().into())
+                        }
+                    };
+                    Ok(response)
                 });
-                join_handle.await.expect("thread panicked")?;
-            }
+                let response = join_handle.await.expect("thread panicked")?;
 
-            let command_context = CommandContext::from_bytes(&entry.context);
-            if let Ok(command_context) = command_context
-                && command_context.node_id == self.raft_group.raft.id
-                && let Some(response_tx) = self.pending_commands.remove(&command_context.command_id)
-            {
-                // Ignore errors if the client has hung up.
-                let _ = response_tx.send(Ok(()));
+                let command_context = CommandContext::from_bytes(&entry.context);
+                if let Ok(command_context) = command_context
+                    && command_context.node_id == self.raft_group.raft.id
+                    && let Some(response_tx) =
+                        self.pending_commands.remove(&command_context.command_id)
+                {
+                    // Ignore errors if the client has hung up.
+                    let _ = response_tx.send(Ok(response));
+                }
             }
         }
         Ok(())
     }
 
-    fn allocate_command_context(&mut self) -> Result<CommandContext> {
+    fn allocate_command_context(&mut self, command_kind: CommandKind) -> Result<CommandContext> {
         let command_id = self.next_command_id;
         self.next_command_id = self
             .next_command_id
             .checked_add(1)
             .ok_or("command ID overflow")?;
-        Ok(CommandContext::new(self.raft_group.raft.id, command_id))
+        Ok(CommandContext::new(
+            self.raft_group.raft.id,
+            command_id,
+            command_kind,
+        ))
     }
 
     fn mut_store(&mut self) -> &mut T {
@@ -319,17 +339,22 @@ pub struct NodeHandle {
 
 #[tonic::async_trait]
 impl KvService for NodeHandle {
-    async fn insert(
+    async fn command(
         &self,
-        request: Request<InsertRequest>,
-    ) -> std::result::Result<Response<InsertResponse>, Status> {
-        let InsertRequest { tuple } = request.into_inner();
+        request: Request<CommandRequest>,
+    ) -> std::result::Result<Response<CommandResponse>, Status> {
+        let CommandRequest { command_bytes } = request.into_inner();
+        let command = Command::new(command_bytes)
+            .map_err(|e| Status::invalid_argument(format!("Failed to parse command: {e}")))?;
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(Message::Insert { tuple, response_tx })
+            .send(Message::Command {
+                command,
+                response_tx,
+            })
             .map_err(|_| Status::unavailable("Server is shutting down"))?;
         match response_rx.await {
-            Ok(Ok(())) => Ok(Response::new(InsertResponse {})),
+            Ok(Ok(response_bytes)) => Ok(Response::new(CommandResponse { response_bytes })),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Status::unavailable("Server is shutting down")),
         }
@@ -391,35 +416,45 @@ impl PeerClient {
 struct CommandContext {
     node_id: u64,
     command_id: u64,
+    command_kind: CommandKind,
 }
 
 impl CommandContext {
-    fn new(node_id: u64, command_id: u64) -> Self {
+    fn new(node_id: u64, command_id: u64, command_kind: CommandKind) -> Self {
         Self {
             node_id,
             command_id,
+            command_kind,
         }
     }
 
     fn into_bytes(self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(size_of::<u64>() * 2);
+        let mut bytes = Vec::with_capacity(size_of::<u64>() * 2 + size_of::<u8>());
         bytes.extend_from_slice(&self.node_id.to_le_bytes());
         bytes.extend_from_slice(&self.command_id.to_le_bytes());
+        bytes.push(self.command_kind as u8);
         bytes
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let (node_id_bytes, command_id_bytes) = bytes
+        let (node_id_bytes, rest_bytes) = bytes
             .split_first_chunk()
             .ok_or_else(|| format!("invalid command context: {bytes:?}"))?;
-        let command_id_bytes = command_id_bytes
-            .try_into()
-            .map_err(|_| format!("invalid command context: {bytes:?}"))?;
+        let (command_id_bytes, command_kind) = rest_bytes
+            .split_first_chunk()
+            .ok_or_else(|| format!("invalid command context: {bytes:?}"))?;
+        if command_kind.len() != 1 {
+            return Err(format!("invalid command context: {bytes:?}").into());
+        }
+        let command_kind = command_kind[0];
 
         let node_id = u64::from_le_bytes(*node_id_bytes);
-        let command_id = u64::from_le_bytes(command_id_bytes);
+        let command_id = u64::from_le_bytes(*command_id_bytes);
+        let command_kind = command_kind
+            .try_into()
+            .map_err(|_| format!("invalid command kind: {command_kind}"))?;
 
-        Ok(Self::new(node_id, command_id))
+        Ok(Self::new(node_id, command_id, command_kind))
     }
 }
 
@@ -455,14 +490,14 @@ pub async fn initialize<T: LogStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Tuple, test_database};
+    use crate::test_database;
     use proptest::prelude::*;
     use raft::storage::MemStorage;
 
     proptest! {
         #[test]
-        fn test_command_context_roundtrip(node_id in any::<u64>(), command_id in any::<u64>()) {
-            let context = CommandContext::new(node_id, command_id);
+        fn test_command_context_roundtrip(node_id in any::<u64>(), command_id in any::<u64>(), command_kind in any::<CommandKind>()) {
+            let context = CommandContext::new(node_id, command_id, command_kind);
             let bytes = context.clone().into_bytes();
             let deserialized = CommandContext::from_bytes(&bytes).unwrap();
             assert_eq!(context, deserialized);
@@ -491,14 +526,29 @@ mod tests {
             })
         };
 
-        for idx in 0..500 {
-            let tuple =
-                Tuple::from_key_value(format!("k{idx}").as_bytes(), format!("v{idx}").as_bytes())
-                    .into_bytes();
-            let request = Request::new(InsertRequest { tuple });
-            match node_handle.insert(request).await {
+        let key = b"k0";
+        let value = b"v0";
+        let command_bytes = Command::insert(key, value).into_bytes();
+        for _ in 0..500 {
+            let request = Request::new(CommandRequest {
+                command_bytes: command_bytes.clone(),
+            });
+            match node_handle.command(request).await {
                 Ok(response) => {
-                    assert_eq!(response.into_inner(), InsertResponse {});
+                    assert_eq!(
+                        response.into_inner(),
+                        CommandResponse {
+                            response_bytes: Some(Bytes::new())
+                        }
+                    );
+
+                    // Read the value back.
+                    let command_bytes = Command::read(key).into_bytes();
+                    let request = Request::new(CommandRequest { command_bytes });
+                    let CommandResponse { response_bytes } =
+                        node_handle.command(request).await.unwrap().into_inner();
+                    assert_eq!(response_bytes, Some(value.as_ref().into()));
+
                     cancellation_token.cancel();
                     task_handle.await.unwrap();
                     return;
