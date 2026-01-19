@@ -10,6 +10,7 @@ publish = false
 andross-server = { path = "../server" }
 bytes = { workspace = true }
 clap = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 
