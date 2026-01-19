@@ -1,7 +1,9 @@
+use andross_server::log_storage::FileStorage;
 use andross_server::{AddrConfig, AndrossConfig, Result, start_server};
 use andross_service::parse_uri;
 use clap::Parser;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Uri;
@@ -28,6 +30,14 @@ struct Args {
     /// The default timeout of requests, if no timeout is specified for the request.
     #[arg(long, default_value = "100ms", value_parser = humantime::parse_duration)]
     default_request_timeout: Duration,
+
+    /// The path to the log directory.
+    #[arg(long)]
+    log_path: PathBuf,
+
+    /// Max log file size in bytes.
+    #[arg(long, default_value = "1024 * 1024 * 1024")]
+    max_log_file_size_bytes: usize,
 }
 
 fn parse_peer(s: &str) -> std::result::Result<(u64, Uri), String> {
@@ -46,12 +56,14 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let peers: HashMap<u64, Uri> = args.peers.into_iter().collect();
+    let log_storage = FileStorage::new(args.log_path, args.max_log_file_size_bytes).await?;
     let config = AndrossConfig {
         id: args.id,
         addr_config: AddrConfig::Port(args.port),
         peers,
         raft_tick_interval: args.raft_tick_interval,
         default_request_timeout: args.default_request_timeout,
+        log_storage,
         cancellation_token: CancellationToken::new(),
     };
 

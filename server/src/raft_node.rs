@@ -4,7 +4,7 @@
 //! and handles communication with other nodes in the cluster.
 
 use crate::Result;
-use crate::storage::Storage;
+use crate::log_storage::LogStorage;
 use andross_service::kv::kv_service_server::KvService;
 use andross_service::kv::raft_service_client::RaftServiceClient;
 use andross_service::kv::raft_service_server::RaftService;
@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Uri};
 use tonic::{Request, Response, Status};
 
-enum Message {
+pub enum Message {
     Command {
         data: Bytes,
         response_tx: oneshot::Sender<std::result::Result<(), Status>>,
@@ -33,7 +33,7 @@ enum Message {
     RaftMessages(Vec<raft::prelude::Message>),
 }
 
-pub struct Node<T: Storage> {
+pub struct Node<T: LogStorage> {
     raft_group: RawNode<T>,
     peers: HashMap<u64, PeerClient>,
 
@@ -46,12 +46,13 @@ pub struct Node<T: Storage> {
     rx: mpsc::UnboundedReceiver<Message>,
 }
 
-impl<T: Storage> Node<T> {
+impl<T: LogStorage> Node<T> {
     async fn new(
         id: u64,
         peers: HashMap<u64, Uri>,
         raft_tick_interval: Duration,
         default_request_timeout: Duration,
+        mut log_storage: T,
         tx: mpsc::UnboundedSender<Message>,
         rx: mpsc::UnboundedReceiver<Message>,
     ) -> Result<Self> {
@@ -60,9 +61,9 @@ impl<T: Storage> Node<T> {
             voters,
             ..ConfState::default()
         };
-        let storage = T::init(conf_state).await;
+        log_storage.set_conf_state(conf_state).await;
         let config = Config::new(id);
-        let raft = RawNode::with_default_logger(&config, storage)?;
+        let raft = RawNode::with_default_logger(&config, log_storage)?;
 
         let peers = peers
             .into_iter()
@@ -192,10 +193,10 @@ impl<T: Storage> Node<T> {
             self.handle_committed_entries(ready.take_committed_entries())
                 .await?;
             if !ready.entries().is_empty() {
-                self.store().append(ready.entries()).await?;
+                self.mut_store().append(ready.entries()).await?;
             }
             if let Some(hard_state) = ready.hs() {
-                self.store().set_hard_state(hard_state.clone()).await;
+                self.mut_store().set_hard_state(hard_state.clone()).await?;
             }
             self.handle_messages(ready.take_persisted_messages())
                 .await?;
@@ -205,7 +206,7 @@ impl<T: Storage> Node<T> {
 
             // Handle light-ready tasks.
             if let Some(commit_index) = light_ready.commit_index() {
-                self.store().set_commit_index(commit_index).await;
+                self.mut_store().set_commit_index(commit_index).await?;
             }
             self.handle_messages(light_ready.take_messages()).await?;
             self.handle_committed_entries(light_ready.take_committed_entries())
@@ -268,8 +269,8 @@ impl<T: Storage> Node<T> {
         Ok(CommandContext::new(self.raft_group.raft.id, command_id))
     }
 
-    fn store(&self) -> &T {
-        self.raft_group.raft.raft_log.store()
+    fn mut_store(&mut self) -> &mut T {
+        self.raft_group.raft.raft_log.mut_store()
     }
 }
 
@@ -373,11 +374,13 @@ impl CommandContext {
         let (node_id_bytes, command_id_bytes) = bytes
             .split_first_chunk()
             .ok_or_else(|| format!("invalid command context: {bytes:?}"))?;
-        let node_id = u64::from_le_bytes(*node_id_bytes);
         let command_id_bytes = command_id_bytes
             .try_into()
             .map_err(|_| format!("invalid command context: {bytes:?}"))?;
+
+        let node_id = u64::from_le_bytes(*node_id_bytes);
         let command_id = u64::from_le_bytes(command_id_bytes);
+
         Ok(Self::new(node_id, command_id))
     }
 }
@@ -387,11 +390,12 @@ impl CommandContext {
 /// # Errors
 ///
 /// Returns an error if the Raft node fails to initialize.
-pub async fn initialize<T: Storage>(
+pub async fn initialize<T: LogStorage>(
     id: u64,
     peers: HashMap<u64, Uri>,
     raft_tick_interval: Duration,
     default_request_timeout: Duration,
+    log_storage: T,
 ) -> Result<(Node<T>, NodeHandle)> {
     let (tx, rx) = mpsc::unbounded_channel();
     let node = Node::new(
@@ -399,6 +403,7 @@ pub async fn initialize<T: Storage>(
         peers,
         raft_tick_interval,
         default_request_timeout,
+        log_storage,
         tx.clone(),
         rx,
     )
@@ -425,11 +430,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_node_command() {
-        let (node, node_handle) = initialize::<MemStorage>(
+        let (node, node_handle) = initialize(
             1,
             HashMap::new(),
             Duration::from_millis(1),
             Duration::from_secs(1),
+            MemStorage::new(),
         )
         .await
         .unwrap();

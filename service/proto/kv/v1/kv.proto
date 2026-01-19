@@ -16,7 +16,8 @@ message CommandRequest {
 message CommandResponse {}
 
 message MessageRequest {
-  // Serialized raft messages.
+  // Serialized raft messages. Ideally we would just import the raft-rs Message proto message and use that here.
+  // Unfortunately, that doesn't seem possible, so we just serialize the whole proto message and use it's bytes.
   repeated bytes messages_bytes = 1;
 }
 
