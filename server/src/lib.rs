@@ -7,6 +7,7 @@ use crate::log_storage::LogStorage;
 use crate::raft_node::initialize;
 use crate::service::kv_service_server::KvServiceServer;
 use crate::service::raft_service_server::RaftServiceServer;
+pub use encodings::{Command, Tuple};
 use std::collections::HashMap;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -16,13 +17,12 @@ use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, Uri};
-pub use tuple::Tuple;
 pub use util::parse_uri;
 
+mod encodings;
 pub mod log_storage;
 pub mod raft_node;
 pub mod service;
-mod tuple;
 pub(crate) mod util;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

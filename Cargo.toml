@@ -18,6 +18,7 @@ futures = "0.3"
 humantime = "2.3"
 itertools = "0.14"
 proptest = "1.9"
+proptest-derive = "0.7"
 prost = "0.14"
 # This is needed because it's the protobuf library raft uses.
 protobuf = { version = "2", features = ["with-bytes"] }

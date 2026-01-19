@@ -1,6 +1,6 @@
-use andross_server::service::InsertRequest;
+use andross_server::service::CommandRequest;
 use andross_server::service::kv_service_client::KvServiceClient;
-use andross_server::{Tuple, parse_uri};
+use andross_server::{Command, parse_uri};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 
@@ -25,33 +25,35 @@ enum Commands {
         #[arg(long)]
         value: Bytes,
     },
+    /// Reads a key-value pair from the database.
+    Read {
+        #[arg(long)]
+        key: Bytes,
+    },
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    match args.command {
-        Commands::Insert { key, value } => {
-            for addr in args.addrs {
-                match send_request(addr, key.clone(), value.clone()).await {
-                    Ok(()) => return,
-                    Err(e) => println!("CLIENT ERROR: {e}"),
-                }
-            }
+    let command = match &args.command {
+        Commands::Insert { key, value } => Command::insert(key, value),
+        Commands::Read { key } => Command::read(key),
+    };
+    for addr in args.addrs {
+        match send_request(addr, command.clone()).await {
+            Ok(()) => return,
+            Err(e) => println!("CLIENT ERROR: {e}"),
         }
     }
 }
 
-async fn send_request(
-    addr: String,
-    key: Bytes,
-    value: Bytes,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn send_request(addr: String, command: Command) -> Result<(), Box<dyn std::error::Error>> {
     let uri = parse_uri(&addr)?;
     let mut client = KvServiceClient::connect(uri).await?;
-    let tuple = Tuple::from_key_value(&key, &value).into_bytes();
-    let request = tonic::Request::new(InsertRequest { tuple });
-    let response = client.insert(request).await?;
+    let request = tonic::Request::new(CommandRequest {
+        command_bytes: command.into_bytes(),
+    });
+    let response = client.command(request).await?;
     println!("RESPONSE={response:?}");
     Ok(())
 }
