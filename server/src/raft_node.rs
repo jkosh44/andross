@@ -3,13 +3,14 @@
 //! This module contains the `Node` struct which manages the Raft state machine
 //! and handles communication with other nodes in the cluster.
 
-use crate::Result;
 use crate::log_storage::LogStorage;
 use crate::service::kv_service_server::KvService;
 use crate::service::raft_service_client::RaftServiceClient;
 use crate::service::raft_service_server::RaftService;
-use crate::service::{CommandRequest, CommandResponse, MessageRequest, MessageResponse};
+use crate::service::{InsertRequest, InsertResponse, MessageRequest, MessageResponse};
+use crate::{Result, Tuple};
 use bytes::Bytes;
+use fjall::KeyspaceCreateOptions;
 use itertools::Itertools;
 use protobuf::{Message as ProtobufMessage, ProtobufResult};
 use raft::prelude::{ConfState, Entry};
@@ -18,19 +19,35 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Uri};
 use tonic::{Request, Response, Status};
 
+// TODO: Support multiple keyspaces.
+/// Fjall keyspace where all data is stored.
+const GLOBAL_KEYSPACE: &str = "andross";
+
 pub enum Message {
-    Command {
-        data: Bytes,
+    Insert {
+        tuple: Bytes,
         response_tx: oneshot::Sender<std::result::Result<(), Status>>,
     },
     CommandTimeout {
         command_id: u64,
     },
     RaftMessages(Vec<raft::prelude::Message>),
+}
+
+pub struct NodeConfig<T: LogStorage> {
+    id: u64,
+    peers: HashMap<u64, Uri>,
+    raft_tick_interval: Duration,
+    default_request_timeout: Duration,
+    log_storage: T,
+    db: fjall::Database,
+    tx: mpsc::UnboundedSender<Message>,
+    rx: mpsc::UnboundedReceiver<Message>,
 }
 
 pub struct Node<T: LogStorage> {
@@ -42,19 +59,24 @@ pub struct Node<T: LogStorage> {
     raft_tick_interval: Duration,
     default_request_timeout: Duration,
 
+    db: fjall::Database,
+
     tx: mpsc::UnboundedSender<Message>,
     rx: mpsc::UnboundedReceiver<Message>,
 }
 
 impl<T: LogStorage> Node<T> {
     async fn new(
-        id: u64,
-        peers: HashMap<u64, Uri>,
-        raft_tick_interval: Duration,
-        default_request_timeout: Duration,
-        mut log_storage: T,
-        tx: mpsc::UnboundedSender<Message>,
-        rx: mpsc::UnboundedReceiver<Message>,
+        NodeConfig {
+            id,
+            peers,
+            raft_tick_interval,
+            default_request_timeout,
+            mut log_storage,
+            db,
+            tx,
+            rx,
+        }: NodeConfig<T>,
     ) -> Result<Self> {
         let voters = std::iter::once(id).chain(peers.keys().copied()).collect();
         let conf_state = ConfState {
@@ -77,6 +99,7 @@ impl<T: LogStorage> Node<T> {
             pending_commands: HashMap::new(),
             raft_tick_interval,
             default_request_timeout,
+            db,
             tx,
             rx,
         })
@@ -104,13 +127,13 @@ impl<T: LogStorage> Node<T> {
                             }
                             self.on_ready().await?;
                         }
-                        Some(Message::Command{ data, response_tx }) => {
+                        Some(Message::Insert{ tuple, response_tx }) => {
                             let command_context = self.allocate_command_context()?;
                             let command_id = command_context.command_id;
 
                             // TODO: This is an unfortunate copy of `data`, there are no other
                             // references to the underlying bytes.
-                            match self.raft_group.propose(command_context.into_bytes(), data.to_vec()) {
+                            match self.raft_group.propose(command_context.into_bytes(), tuple.to_vec()) {
                                 Ok(()) => {
                                     let previous = self.pending_commands.insert(command_id, response_tx);
                                     assert!(previous.is_none(), "command ID reuse");
@@ -243,10 +266,26 @@ impl<T: LogStorage> Node<T> {
         Ok(())
     }
 
-    #[expect(clippy::unused_async)]
     async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) -> Result<()> {
         for entry in committed_entries {
-            // TODO: Actually apply the entry.
+            println!("committed entry: {entry:?}");
+
+            if !entry.data.is_empty() {
+                let tuple = Tuple::new(entry.data)?;
+                let (key, value) = tuple.to_key_value();
+                let db = self.db.clone();
+                let join_handle: JoinHandle<Result<()>> = spawn_blocking(move || {
+                    // Raft log is what provides durability, not the LSM tree. Any writes that are
+                    // not persisted will be replayed from the Raft log.
+                    let create_options =
+                        KeyspaceCreateOptions::default().manual_journal_persist(true);
+                    let items = db.keyspace(GLOBAL_KEYSPACE, || create_options)?;
+                    items.insert(key.as_ref(), value.as_ref())?;
+                    Ok(())
+                });
+                join_handle.await.expect("thread panicked")?;
+            }
+
             let command_context = CommandContext::from_bytes(&entry.context);
             if let Ok(command_context) = command_context
                 && command_context.node_id == self.raft_group.raft.id
@@ -255,7 +294,6 @@ impl<T: LogStorage> Node<T> {
                 // Ignore errors if the client has hung up.
                 let _ = response_tx.send(Ok(()));
             }
-            println!("COMMITTED: {entry:?}");
         }
         Ok(())
     }
@@ -281,17 +319,17 @@ pub struct NodeHandle {
 
 #[tonic::async_trait]
 impl KvService for NodeHandle {
-    async fn command(
+    async fn insert(
         &self,
-        request: Request<CommandRequest>,
-    ) -> std::result::Result<Response<CommandResponse>, Status> {
-        let CommandRequest { data } = request.into_inner();
+        request: Request<InsertRequest>,
+    ) -> std::result::Result<Response<InsertResponse>, Status> {
+        let InsertRequest { tuple } = request.into_inner();
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(Message::Command { data, response_tx })
+            .send(Message::Insert { tuple, response_tx })
             .map_err(|_| Status::unavailable("Server is shutting down"))?;
         match response_rx.await {
-            Ok(Ok(())) => Ok(Response::new(CommandResponse {})),
+            Ok(Ok(())) => Ok(Response::new(InsertResponse {})),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(Status::unavailable("Server is shutting down")),
         }
@@ -396,18 +434,20 @@ pub async fn initialize<T: LogStorage>(
     raft_tick_interval: Duration,
     default_request_timeout: Duration,
     log_storage: T,
+    db: fjall::Database,
 ) -> Result<(Node<T>, NodeHandle)> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let node = Node::new(
+    let node_config = NodeConfig {
         id,
         peers,
         raft_tick_interval,
         default_request_timeout,
         log_storage,
-        tx.clone(),
+        db,
+        tx: tx.clone(),
         rx,
-    )
-    .await?;
+    };
+    let node = Node::new(node_config).await?;
     let node_handle = NodeHandle { tx };
     Ok((node, node_handle))
 }
@@ -415,6 +455,7 @@ pub async fn initialize<T: LogStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Tuple, test_database};
     use proptest::prelude::*;
     use raft::storage::MemStorage;
 
@@ -430,12 +471,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_node_command() {
+        let (db, _temp_dir) = test_database().await;
         let (node, node_handle) = initialize(
             1,
             HashMap::new(),
             Duration::from_millis(1),
             Duration::from_secs(1),
             MemStorage::new(),
+            db,
         )
         .await
         .unwrap();
@@ -448,12 +491,14 @@ mod tests {
             })
         };
 
-        let data = Bytes::from("hello");
-        for _ in 0..500 {
-            let request = Request::new(CommandRequest { data: data.clone() });
-            match node_handle.command(request).await {
+        for idx in 0..500 {
+            let tuple =
+                Tuple::from_key_value(format!("k{idx}").as_bytes(), format!("v{idx}").as_bytes())
+                    .into_bytes();
+            let request = Request::new(InsertRequest { tuple });
+            match node_handle.insert(request).await {
                 Ok(response) => {
-                    assert_eq!(response.into_inner(), CommandResponse {});
+                    assert_eq!(response.into_inner(), InsertResponse {});
                     cancellation_token.cancel();
                     task_handle.await.unwrap();
                     return;

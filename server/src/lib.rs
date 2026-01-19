@@ -9,16 +9,20 @@ use crate::service::kv_service_server::KvServiceServer;
 use crate::service::raft_service_server::RaftServiceServer;
 use std::collections::HashMap;
 use std::time::Duration;
+use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::select;
+use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, Uri};
+pub use tuple::Tuple;
 pub use util::parse_uri;
 
 pub mod log_storage;
 pub mod raft_node;
 pub mod service;
+mod tuple;
 pub(crate) mod util;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -30,6 +34,7 @@ pub struct AndrossConfig<T: LogStorage> {
     pub raft_tick_interval: Duration,
     pub default_request_timeout: Duration,
     pub log_storage: T,
+    pub db: fjall::Database,
     pub cancellation_token: CancellationToken,
 }
 
@@ -54,6 +59,7 @@ pub async fn start_server<T: LogStorage + Send + 'static>(
         raft_tick_interval,
         default_request_timeout,
         log_storage,
+        db,
         cancellation_token,
     }: AndrossConfig<T>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
@@ -63,6 +69,7 @@ pub async fn start_server<T: LogStorage + Send + 'static>(
         raft_tick_interval,
         default_request_timeout,
         log_storage,
+        db,
     )
     .await?;
 
@@ -112,4 +119,20 @@ pub async fn start_server<T: LogStorage + Send + 'static>(
         Ok(())
     });
     Ok(join_handle)
+}
+
+pub async fn test_database() -> (fjall::Database, TempDir) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().to_path_buf();
+    let db = spawn_blocking(move || {
+        fjall::Database::builder(&path)
+            .manual_journal_persist(true)
+            .temporary(true)
+            .open()
+    })
+    .await
+    .expect("thread panicked")
+    .unwrap();
+
+    (db, temp_dir)
 }

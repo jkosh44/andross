@@ -1,9 +1,10 @@
-use andross_server::service::CommandRequest;
+use andross_server::service::InsertRequest;
 use andross_server::service::kv_service_client::KvServiceClient;
-use andross_server::{AddrConfig, AndrossConfig, parse_uri, start_server};
+use andross_server::{AddrConfig, AndrossConfig, Tuple, parse_uri, start_server, test_database};
 use raft::storage::MemStorage;
 use std::collections::HashMap;
 use std::time::Duration;
+use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
@@ -12,6 +13,7 @@ use tonic::transport::Channel;
 struct ServerHandle {
     client: KvServiceClient<Channel>,
     cancellation_token: CancellationToken,
+    _temp_dir: TempDir,
     join_handle: tokio::task::JoinHandle<andross_server::Result<()>>,
 }
 
@@ -47,6 +49,7 @@ async fn test_three_node_cluster() {
             .filter(|(peer_id, _)| *peer_id != node_id)
             .collect();
         let cancellation_token = CancellationToken::new();
+        let (db, temp_dir) = test_database().await;
         let config = AndrossConfig {
             id: node_id,
             addr_config: AddrConfig::TcpListener(listener),
@@ -54,6 +57,7 @@ async fn test_three_node_cluster() {
             raft_tick_interval: Duration::from_millis(1),
             default_request_timeout: Duration::from_secs(5),
             log_storage: MemStorage::new(),
+            db,
             cancellation_token: cancellation_token.clone(),
         };
 
@@ -61,24 +65,24 @@ async fn test_three_node_cluster() {
 
         let uri = parse_uri(&addr.to_string()).unwrap();
         let client = KvServiceClient::connect(uri).await.unwrap();
-
         let server = ServerHandle {
             client,
             cancellation_token,
+            _temp_dir: temp_dir,
             join_handle,
         };
         servers.push(server);
     }
 
-    // Send a command to the cluster.
-
-    let data = bytes::Bytes::from("hello");
-    let request = CommandRequest { data };
-
+    // Send an insert to the cluster.
     let mut success = false;
-    for _ in 0..500 {
+    for idx in 0..500 {
+        let tuple =
+            Tuple::from_key_value(format!("k{idx}").as_bytes(), format!("v{idx}").as_bytes())
+                .into_bytes();
+        let request = InsertRequest { tuple };
         for ServerHandle { client, .. } in &mut servers {
-            if client.command(Request::new(request.clone())).await.is_ok() {
+            if client.insert(Request::new(request.clone())).await.is_ok() {
                 success = true;
                 break;
             }

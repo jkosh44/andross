@@ -4,6 +4,7 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Uri;
 
@@ -34,9 +35,14 @@ struct Args {
     #[arg(long)]
     log_path: PathBuf,
 
+    // Default value is 100 MB.
     /// Max log file size in bytes.
-    #[arg(long, default_value = "1024 * 1024 * 1024")]
+    #[arg(long, default_value = "104857600")]
     max_log_file_size_bytes: usize,
+
+    /// The path to the database directory.
+    #[arg(long)]
+    database_path: PathBuf,
 }
 
 fn parse_peer(s: &str) -> std::result::Result<(u64, Uri), String> {
@@ -56,6 +62,16 @@ async fn main() -> Result<()> {
 
     let peers: HashMap<u64, Uri> = args.peers.into_iter().collect();
     let log_storage = FileStorage::new(args.log_path, args.max_log_file_size_bytes).await?;
+    let database_path = args.database_path;
+    let db = spawn_blocking(move || {
+        fjall::Database::builder(&database_path)
+            // Raft log is what provides durability, not the LSM tree. Any writes that are
+            // not persisted will be replayed from the Raft log.
+            .manual_journal_persist(true)
+            .open()
+    })
+    .await
+    .expect("thread panicked")?;
     let config = AndrossConfig {
         id: args.id,
         addr_config: AddrConfig::Port(args.port),
@@ -63,10 +79,12 @@ async fn main() -> Result<()> {
         raft_tick_interval: args.raft_tick_interval,
         default_request_timeout: args.default_request_timeout,
         log_storage,
+        db,
         cancellation_token: CancellationToken::new(),
     };
 
-    start_server(config).await?.await??;
+    let join_handle = start_server(config).await?;
+    join_handle.await??;
 
     Ok(())
 }
