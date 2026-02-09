@@ -66,12 +66,6 @@ const HARD_STATE_FILE_NAME: &str = "hardstate";
 const DIRECTORY_FILE_NAME: &str = "directory";
 /// Directory containing log files.
 const LOG_PATH: &str = "logs";
-/// Size in bytes of the hard state file.
-const HARD_STATE_FILE_SIZE: usize = size_of::<u64>() * 3;
-/// Size in bytes of a log file entry in the directory file.
-const LOG_FILE_ENTRY_SIZE: usize = size_of::<u64>() * 2;
-/// Size in bytes of the header of a log entry.
-const ENTRY_HEADER_SIZE: usize = size_of::<i32>() + size_of::<u64>() * 3;
 
 /// Storage implementation that persists logs to files.
 pub struct FileStorage {
@@ -322,17 +316,16 @@ impl FileStorage {
             // TODO: handle torn writes.
             let entry_header = EntryHeader::from_bytes(&bytes).expect("torn write");
             let mut data = vec![0; u64_to_usize(entry_header.data_len)];
-            let read = match file.read_exact(&mut data).await {
-                Ok(read) => read,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
-            assert_eq!(read as u64, entry_header.data_len);
+            file.read_exact(&mut data).await?;
+            let mut context = vec![0; u64_to_usize(entry_header.context_len)];
+            file.read_exact(&mut context).await?;
+
             let entry = Entry {
                 entry_type: entry_header.entry_type,
                 term: entry_header.term,
                 index: entry_header.index,
                 data: data.into(),
+                context: context.into(),
             };
             entries.push(entry);
         }
@@ -460,7 +453,7 @@ impl LogStorage for FileStorage {
 
             let entry: Entry = entry.into();
             let header_bytes = entry.header().to_bytes();
-            let entry_len = header_bytes.len() + entry.data.len();
+            let entry_len = header_bytes.len() + entry.data.len() + entry.context.len();
             let metadata = file.metadata().await?;
 
             // The current log file has grown to large so create a new one.
@@ -493,6 +486,7 @@ impl LogStorage for FileStorage {
 
             file.write_all(&header_bytes).await?;
             file.write_all(&entry.data).await?;
+            file.write_all(&entry.context).await?;
             self.last_log_index = entry.index;
             self.update_terms(&entry);
             self.entries.push(entry);
@@ -529,6 +523,9 @@ impl LogStorage for FileStorage {
         Ok(())
     }
 }
+
+/// Size in bytes of the hard state file.
+const HARD_STATE_FILE_SIZE: usize = size_of::<u64>() * 3;
 
 /// Represents the Raft hard state to be persisted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -626,6 +623,9 @@ impl Directory {
     }
 }
 
+/// Size in bytes of a log file entry in the directory file.
+const LOG_FILE_ENTRY_SIZE: usize = size_of::<u64>() * 2;
+
 /// Entry in the log directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogFileEntry {
@@ -666,6 +666,7 @@ struct Entry {
     term: u64,
     index: u64,
     data: Bytes,
+    context: Bytes,
 }
 
 impl Entry {
@@ -675,6 +676,7 @@ impl Entry {
             term: self.term,
             index: self.index,
             data_len: self.data.len() as u64,
+            context_len: self.context.len() as u64,
         }
     }
 }
@@ -692,6 +694,7 @@ impl From<&raft::prelude::Entry> for Entry {
             term: entry.term,
             index: entry.index,
             data: entry.data.clone(),
+            context: entry.context.clone(),
         }
     }
 }
@@ -714,13 +717,16 @@ impl TryFrom<&Entry> for raft::prelude::Entry {
             term: entry.term,
             index: entry.index,
             data: entry.data.clone(),
-            context: Bytes::new(),
+            context: entry.context.clone(),
             sync_log: false,
             unknown_fields: UnknownFields::default(),
             cached_size: CachedSize::default(),
         })
     }
 }
+
+/// Size in bytes of the header of a log entry.
+const ENTRY_HEADER_SIZE: usize = size_of::<i32>() + size_of::<u64>() * 4;
 
 /// Header for a log entry stored on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -729,6 +735,7 @@ struct EntryHeader {
     term: u64,
     index: u64,
     data_len: u64,
+    context_len: u64,
 }
 
 impl EntryHeader {
@@ -738,6 +745,7 @@ impl EntryHeader {
         bytes.extend_from_slice(&self.term.to_le_bytes());
         bytes.extend_from_slice(&self.index.to_le_bytes());
         bytes.extend_from_slice(&self.data_len.to_le_bytes());
+        bytes.extend_from_slice(&self.context_len.to_le_bytes());
         bytes
     }
 
@@ -751,20 +759,25 @@ impl EntryHeader {
         let (index_bytes, rest_bytes) = rest_bytes
             .split_first_chunk()
             .ok_or_else(|| format!("invalid log entry header: {bytes:?}"))?;
-        let data_len_bytes: [u8; size_of::<u64>()] = rest_bytes
+        let (data_len_bytes, context_len_bytes) = rest_bytes
+            .split_first_chunk()
+            .ok_or_else(|| format!("invalid log entry header: {bytes:?}"))?;
+        let context_len_bytes: [u8; size_of::<u64>()] = context_len_bytes
             .try_into()
             .map_err(|_| format!("invalid log file entry header: {bytes:?}"))?;
 
         let entry_type = i32::from_le_bytes(*entry_type_bytes);
         let term = u64::from_le_bytes(*term_bytes);
         let index = u64::from_le_bytes(*index_bytes);
-        let data_len = u64::from_le_bytes(data_len_bytes);
+        let data_len = u64::from_le_bytes(*data_len_bytes);
+        let context_len = u64::from_le_bytes(context_len_bytes);
 
         Ok(Self {
             entry_type,
             term,
             index,
             data_len,
+            context_len,
         })
     }
 }
@@ -806,7 +819,13 @@ mod tests {
 
         #[test]
         fn test_entry_header_roundtrip(entry_type in any::<i32>(), term in any::<u64>(), index in any::<u64>(), data_len in any::<u64>()) {
-            let header = EntryHeader { entry_type, term, index, data_len };
+            let header = EntryHeader {
+                entry_type,
+                term,
+                index,
+                data_len,
+                context_len: 0,
+            };
             let bytes = header.to_bytes();
             let header2 = EntryHeader::from_bytes(&bytes).unwrap();
             assert_eq!(header, header2);
@@ -832,6 +851,7 @@ mod tests {
                     term,
                     index,
                     data,
+                    context: Bytes::new(),
                 };
                 entry.try_into().unwrap()
             })

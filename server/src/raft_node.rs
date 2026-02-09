@@ -124,7 +124,6 @@ impl<T: LogStorage> Node<T> {
                     match message {
                         Some(Message::RaftMessages(messages)) => {
                             for message in messages {
-                                // println!("raft message: {message:?}");
                                 self.raft_group.step(message)?;
                             }
                             self.on_ready().await?;
@@ -186,7 +185,6 @@ impl<T: LogStorage> Node<T> {
                                     let _ = response_tx.send(Err(Status::failed_precondition(e.to_string())));
                                 },
                             }
-
                         }
                         Some(Message::CommandTimeout{ command_id }) => {
                             if let Some(response_tx) = self.pending_commands.remove(&command_id) {
