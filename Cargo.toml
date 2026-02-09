@@ -24,6 +24,7 @@ prost = "0.14"
 protobuf = { version = "2", features = ["with-bytes"] }
 raft = { git = "https://github.com/tikv/raft-rs.git", rev = "1fd05e000fb094015507c5c985849d370100fb72" }
 tempfile = "3.24"
+thiserror = "2.0.18"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "fs"] }
 tokio-util = "0.7"
 tonic = "0.14"

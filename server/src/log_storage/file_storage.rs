@@ -395,13 +395,17 @@ impl raft::prelude::Storage for FileStorage {
             .entries
             .binary_search_by_key(&low, |entry| entry.index)
             .map_err(|_| raft::Error::Store(raft::StorageError::Compacted))?;
-        Ok(self.entries[start_idx..size]
+        Ok(self.entries[start_idx..(start_idx + size)]
             .iter()
             .map(|entry| entry.try_into().expect("invalid entry"))
             .collect())
     }
 
     fn term(&self, idx: u64) -> raft::Result<u64> {
+        if idx == 0 {
+            return Ok(0);
+        }
+
         match self.log_terms.binary_search_by(|(idx_range, _)| {
             if idx_range.end <= idx {
                 Ordering::Less

@@ -124,6 +124,7 @@ impl<T: LogStorage> Node<T> {
                     match message {
                         Some(Message::RaftMessages(messages)) => {
                             for message in messages {
+                                // println!("raft message: {message:?}");
                                 self.raft_group.step(message)?;
                             }
                             self.on_ready().await?;

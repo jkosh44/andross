@@ -28,7 +28,7 @@ struct Args {
     raft_tick_interval: Duration,
 
     /// The default timeout of requests, if no timeout is specified for the request.
-    #[arg(long, default_value = "100ms", value_parser = humantime::parse_duration)]
+    #[arg(long, default_value = "1s", value_parser = humantime::parse_duration)]
     default_request_timeout: Duration,
 
     /// The path to the log directory.
@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
 
     let peers: HashMap<u64, Uri> = args.peers.into_iter().collect();
     let log_storage = FileStorage::new(args.log_path, args.max_log_file_size_bytes).await?;
+    // let log_storage = MemStorage::new();
     let database_path = args.database_path;
     let db = spawn_blocking(move || {
         fjall::Database::builder(&database_path)
