@@ -61,7 +61,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let peers: HashMap<u64, Uri> = args.peers.into_iter().collect();
-    let log_storage = FileStorage::new(args.log_path, args.max_log_file_size_bytes).await?;
+    let log_storage =
+        spawn_blocking(move || FileStorage::new(args.log_path, args.max_log_file_size_bytes))
+            .await
+            .expect("thread panicked")?;
     let database_path = args.database_path;
     let db = spawn_blocking(move || {
         fjall::Database::builder(&database_path)

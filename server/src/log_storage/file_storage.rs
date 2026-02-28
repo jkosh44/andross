@@ -53,12 +53,11 @@ use raft::eraftpb::{ConfState, Snapshot};
 use raft::prelude::EntryType;
 use raft::{GetEntriesContext, RaftState};
 use std::cmp::Ordering;
-use std::io::SeekFrom;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::PathBuf;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::{fs, io};
+use std::{fs, io};
 
 /// Filename containing Raft hard state.
 const HARD_STATE_FILE_NAME: &str = "hardstate";
@@ -99,8 +98,8 @@ impl FileStorage {
     /// # Errors
     ///
     /// Returns an error if the file system returns an error or if there is a torn write in the log.
-    pub async fn new(path: PathBuf, max_log_file_size_bytes: usize) -> Result<Self> {
-        fs::create_dir_all(&path).await?;
+    pub fn new(path: PathBuf, max_log_file_size_bytes: usize) -> Result<Self> {
+        fs::create_dir_all(&path)?;
 
         let mut storage = Self {
             raft_state: RaftState::default(),
@@ -114,42 +113,41 @@ impl FileStorage {
             entries: Vec::new(),
         };
 
-        fs::create_dir_all(&storage.logs_path()).await?;
+        fs::create_dir_all(storage.logs_path())?;
 
         // Read hard state in from disk if it exists.
-        match storage.read_hard_state().await? {
+        match storage.read_hard_state()? {
             Some(hard_state) => storage.raft_state.hard_state = hard_state.into(),
             None => {
-                storage.persist_hard_state().await?;
+                storage.persist_hard_state()?;
             }
         }
 
         // Read the directory in from disk if it exists.
-        let mut directory = storage.read_directory().await?;
+        let mut directory = storage.read_directory()?;
         // If the directory is empty, add an entry for the first log file.
         if directory.entries.is_empty() {
             let mut directory_file = File::options()
                 .create(true)
                 .append(true)
-                .open(storage.directory_path())
-                .await?;
+                .open(storage.directory_path())?;
             let log_file_entry = LogFileEntry {
                 id: 0,
                 start_index: 1,
             };
             let log_file_entry_bytes = log_file_entry.to_bytes();
             directory.entries.push(log_file_entry);
-            directory_file.write_all(&log_file_entry_bytes).await?;
-            directory_file.flush().await?;
-            directory_file.sync_all().await?;
+            directory_file.write_all(&log_file_entry_bytes)?;
+            directory_file.flush()?;
+            directory_file.sync_all()?;
         }
         storage.directory = directory;
 
         // Read in all log file metadata.
-        let mut read_dir = fs::read_dir(&storage.logs_path()).await?;
+        let mut read_dir = fs::read_dir(storage.logs_path())?;
         let mut log_files = Vec::new();
-        while let Some(entry) = read_dir.next_entry().await? {
-            let file_type = entry.file_type().await?;
+        while let Some(entry) = read_dir.next().transpose()? {
+            let file_type = entry.file_type()?;
             assert!(file_type.is_file(), "{file_type:?} is not a file");
             let log_id = entry
                 .file_name()
@@ -170,7 +168,7 @@ impl FileStorage {
             && let Some((log_id, log_file)) = log_files.get(log_file_idx)
             && directory_entry.id > *log_id
         {
-            fs::remove_file(log_file.path()).await?;
+            fs::remove_file(log_file.path())?;
             log_file_idx += 1;
         }
 
@@ -181,7 +179,7 @@ impl FileStorage {
             && directory_entry.id == *log_id
         {
             // TODO: Handle torn write.
-            let entries = storage.read_log_entries(*log_id).await.expect("torn write");
+            let entries = storage.read_log_entries(*log_id).expect("torn write");
             for entry in entries {
                 if !first_index_set {
                     storage.first_log_index = entry.index;
@@ -204,7 +202,7 @@ impl FileStorage {
         // Create log files for any directory entries that don't have a corresponding log file.
         while let Some(directory_entry) = storage.directory.entries.get(directory_idx) {
             let path = storage.log_path(directory_entry.id);
-            File::create(path).await?;
+            File::create(path)?;
             storage.current_log_id = directory_entry.id;
             directory_idx += 1;
         }
@@ -249,76 +247,70 @@ impl FileStorage {
         self.logs_path().join(log_id.to_string())
     }
 
-    async fn read_hard_state(&self) -> io::Result<Option<HardState>> {
+    fn read_hard_state(&self) -> io::Result<Option<HardState>> {
         let mut file = File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.hard_state_path())
-            .await?;
+            .open(self.hard_state_path())?;
 
         // The process must have crashed when first writing to the hard state file,
         // before all the information was written. Therefore, we delete the file and
         // start over.
-        let file_len = file.metadata().await?.len();
+        let file_len = file.metadata()?.len();
         if file_len != HARD_STATE_FILE_SIZE as u64 {
             assert_eq!(file_len, 0);
             return Ok(None);
         }
 
         let mut bytes = Vec::with_capacity(HARD_STATE_FILE_SIZE);
-        file.read_to_end(&mut bytes).await?;
+        file.read_to_end(&mut bytes)?;
 
         let hard_state = HardState::from_bytes(&bytes).expect("file size checked");
         Ok(Some(hard_state))
     }
 
-    async fn read_directory(&self) -> io::Result<Directory> {
+    fn read_directory(&self) -> io::Result<Directory> {
         let mut file = File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.directory_path())
-            .await?;
+            .open(self.directory_path())?;
 
         // Truncate any torn writes.
-        let mut file_len = file.metadata().await?.len();
+        let mut file_len = file.metadata()?.len();
         let torn_write_len = file_len % LOG_FILE_ENTRY_SIZE as u64;
         if torn_write_len > 0 {
             file_len -= torn_write_len;
-            file.set_len(file_len).await?;
+            file.set_len(file_len)?;
         }
 
         let mut bytes = Vec::with_capacity(u64_to_usize(file_len));
-        file.read_to_end(&mut bytes).await?;
+        file.read_to_end(&mut bytes)?;
 
         let directory = Directory::from_bytes(&bytes).expect("file size checked");
         Ok(directory)
     }
 
-    async fn read_log_entries(&self, log_id: u64) -> io::Result<Vec<Entry>> {
-        let mut file = File::options()
-            .read(true)
-            .open(self.log_path(log_id))
-            .await?;
+    fn read_log_entries(&self, log_id: u64) -> io::Result<Vec<Entry>> {
+        let mut file = File::options().read(true).open(self.log_path(log_id))?;
         let mut entries = Vec::new();
         let mut bytes = [0; ENTRY_HEADER_SIZE];
 
         loop {
-            let read = match file.read_exact(&mut bytes).await {
-                Ok(read) => read,
+            match file.read_exact(&mut bytes) {
+                Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(e) => return Err(e),
-            };
-            assert_eq!(read, ENTRY_HEADER_SIZE);
+            }
             // TODO: handle torn writes.
             let entry_header = EntryHeader::from_bytes(&bytes).expect("torn write");
             let mut data = vec![0; u64_to_usize(entry_header.data_len)];
-            file.read_exact(&mut data).await?;
+            file.read_exact(&mut data)?;
             let mut context = vec![0; u64_to_usize(entry_header.context_len)];
-            file.read_exact(&mut context).await?;
+            file.read_exact(&mut context)?;
 
             let entry = Entry {
                 entry_type: entry_header.entry_type,
@@ -333,7 +325,7 @@ impl FileStorage {
         Ok(entries)
     }
 
-    async fn persist_hard_state(&self) -> io::Result<()> {
+    fn persist_hard_state(&self) -> io::Result<()> {
         let hard_state: HardState = (&self.raft_state.hard_state).into();
         let bytes = hard_state.to_bytes();
 
@@ -345,23 +337,22 @@ impl FileStorage {
                 .write(true)
                 .truncate(true)
                 .create(true)
-                .open(&path)
-                .await?;
-            temp_file.write_all(&bytes).await?;
-            temp_file.flush().await?;
-            temp_file.sync_all().await?;
+                .open(&path)?;
+            temp_file.write_all(&bytes)?;
+            temp_file.flush()?;
+            temp_file.sync_all()?;
         }
 
         // Atomically rename the temporary file to the hard state file.
         let hard_state_path = self.hard_state_path();
-        fs::rename(path, &hard_state_path).await?;
+        fs::rename(path, &hard_state_path)?;
 
         // We need to fsync the parent after a rename.
         let parent_path = hard_state_path
             .parent()
             .expect("hard state file must have a parent");
-        let parent_file = File::open(parent_path).await?;
-        parent_file.sync_all().await?;
+        let parent_file = File::open(parent_path)?;
+        parent_file.sync_all()?;
         Ok(())
     }
 }
@@ -433,20 +424,18 @@ impl raft::prelude::Storage for FileStorage {
     }
 }
 
-#[tonic::async_trait]
 impl LogStorage for FileStorage {
-    async fn set_conf_state(&mut self, conf_state: ConfState) {
+    fn set_conf_state(&mut self, conf_state: ConfState) {
         self.raft_state.conf_state = conf_state;
     }
 
-    async fn append(&mut self, entries: &[raft::prelude::Entry]) -> raft::Result<()> {
+    fn append(&mut self, entries: &[raft::prelude::Entry]) -> raft::Result<()> {
         let current_file_path = self.log_path(self.current_log_id);
-        let mut file = File::options().append(true).open(current_file_path).await?;
+        let mut file = File::options().append(true).open(current_file_path)?;
         let mut directory_file = File::options()
             .create(true)
             .append(true)
-            .open(self.directory_path())
-            .await?;
+            .open(self.directory_path())?;
 
         for entry in entries {
             assert_eq!(entry.index, self.last_log_index + 1);
@@ -454,7 +443,7 @@ impl LogStorage for FileStorage {
             let entry: Entry = entry.into();
             let header_bytes = entry.header().to_bytes();
             let entry_len = header_bytes.len() + entry.data.len() + entry.context.len();
-            let metadata = file.metadata().await?;
+            let metadata = file.metadata()?;
 
             // The current log file has grown to large so create a new one.
             if metadata.len() > 0
@@ -468,58 +457,56 @@ impl LogStorage for FileStorage {
                 };
                 let log_file_entry_bytes = log_file_entry.to_bytes();
                 self.directory.entries.push(log_file_entry);
-                directory_file.write_all(&log_file_entry_bytes).await?;
-                directory_file.flush().await?;
-                directory_file.sync_all().await?;
+                directory_file.write_all(&log_file_entry_bytes)?;
+                directory_file.flush()?;
+                directory_file.sync_all()?;
 
-                file.flush().await?;
-                file.sync_all().await?;
+                file.flush()?;
+                file.sync_all()?;
 
                 let current_file_path = self.log_path(self.current_log_id);
                 file = File::options()
                     .append(true)
                     .create(true)
                     .truncate(false)
-                    .open(current_file_path)
-                    .await?;
+                    .open(current_file_path)?;
             }
 
-            file.write_all(&header_bytes).await?;
-            file.write_all(&entry.data).await?;
-            file.write_all(&entry.context).await?;
+            file.write_all(&header_bytes)?;
+            file.write_all(&entry.data)?;
+            file.write_all(&entry.context)?;
             self.last_log_index = entry.index;
             self.update_terms(&entry);
             self.entries.push(entry);
         }
 
-        file.flush().await?;
-        file.sync_all().await?;
+        file.flush()?;
+        file.sync_all()?;
 
         Ok(())
     }
 
-    async fn set_hard_state(&mut self, hard_state: raft::prelude::HardState) -> io::Result<()> {
+    fn set_hard_state(&mut self, hard_state: raft::prelude::HardState) -> io::Result<()> {
         self.raft_state.hard_state = hard_state;
-        self.persist_hard_state().await
+        self.persist_hard_state()
     }
 
-    async fn set_commit_index(&mut self, commit_index: u64) -> io::Result<()> {
+    fn set_commit_index(&mut self, commit_index: u64) -> io::Result<()> {
         self.raft_state.hard_state.commit = commit_index;
 
         let mut file = File::options()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.directory_path())
-            .await?;
+            .open(self.directory_path())?;
         // Probably unnecessary, but seek to the start of the file.
         // The commit index is the first 64 bits, so overwrite the old index with the new one. We're
         // assuming that the disk can write 64 bits atomically, otherwise we need to worry about
         // torn writes.
-        file.seek(SeekFrom::Start(0)).await?;
-        file.write_all(&commit_index.to_le_bytes()).await?;
-        file.flush().await?;
-        file.sync_all().await?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&commit_index.to_le_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
         Ok(())
     }
 }
@@ -832,8 +819,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_file_storage_basic() {
+    #[test]
+    fn test_file_storage_basic() {
         const MAX_LOG_SIZE: usize = 256;
         const NUM_ENTRIES: usize = 128;
 
@@ -858,7 +845,7 @@ mod tests {
             .collect();
 
         // Create new storage
-        let mut storage = FileStorage::new(path.clone(), MAX_LOG_SIZE).await.unwrap();
+        let mut storage = FileStorage::new(path.clone(), MAX_LOG_SIZE).unwrap();
 
         // Initial state
         let state = storage.initial_state().unwrap();
@@ -867,8 +854,8 @@ mod tests {
         assert_eq!(storage.last_index().unwrap(), 0);
 
         // Append entries
-        storage.append(&entries[..NUM_ENTRIES / 2]).await.unwrap();
-        storage.append(&entries[NUM_ENTRIES / 2..]).await.unwrap();
+        storage.append(&entries[..NUM_ENTRIES / 2]).unwrap();
+        storage.append(&entries[NUM_ENTRIES / 2..]).unwrap();
 
         // Persist hard state
         let commit = usize_to_u64(entries.len()) / 2;
@@ -878,10 +865,7 @@ mod tests {
             term,
             vote: 2,
         };
-        storage
-            .set_hard_state(hard_state.clone().into())
-            .await
-            .unwrap();
+        storage.set_hard_state(hard_state.clone().into()).unwrap();
 
         for _ in 0..2 {
             assert_eq!(storage.last_index().unwrap(), usize_to_u64(NUM_ENTRIES));
@@ -900,12 +884,12 @@ mod tests {
                 .unwrap();
             assert_eq!(fetched_entries, entries);
 
-            let fetched_hard_state = storage.read_hard_state().await.unwrap().unwrap();
+            let fetched_hard_state = storage.read_hard_state().unwrap().unwrap();
             assert_eq!(fetched_hard_state, hard_state);
 
             // Reopen storage
             drop(storage);
-            storage = FileStorage::new(path.clone(), MAX_LOG_SIZE).await.unwrap();
+            storage = FileStorage::new(path.clone(), MAX_LOG_SIZE).unwrap();
 
             let state = storage.initial_state().unwrap();
             assert_eq!(state.hard_state, hard_state.clone().into());

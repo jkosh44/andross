@@ -4,6 +4,7 @@
 //! and handles communication with other nodes in the cluster.
 
 use crate::Result;
+use crate::async_raft_group::{AsyncLogStorage, AsyncRawNode};
 use crate::encodings::{Command, CommandInner, CommandKind};
 use crate::log_storage::LogStorage;
 use crate::service::kv_service_server::KvService;
@@ -52,7 +53,7 @@ pub struct NodeConfig<T: LogStorage> {
 }
 
 pub struct Node<T: LogStorage> {
-    raft_group: RawNode<T>,
+    raft_group: AsyncRawNode<T>,
     peers: HashMap<u64, PeerClient>,
 
     next_command_id: u64,
@@ -66,7 +67,7 @@ pub struct Node<T: LogStorage> {
     rx: mpsc::UnboundedReceiver<Message>,
 }
 
-impl<T: LogStorage> Node<T> {
+impl<T: LogStorage + Send + 'static> Node<T> {
     async fn new(
         NodeConfig {
             id,
@@ -84,9 +85,15 @@ impl<T: LogStorage> Node<T> {
             voters,
             ..ConfState::default()
         };
-        log_storage.set_conf_state(conf_state).await;
+        let log_storage = spawn_blocking(move || {
+            log_storage.set_conf_state(conf_state);
+            log_storage
+        })
+        .await
+        .expect("thread panicked");
         let config = Config::new(id);
-        let raft = RawNode::with_default_logger(&config, log_storage)?;
+        let raft_group = RawNode::with_default_logger(&config, log_storage)?;
+        let raft_group = AsyncRawNode::new(raft_group);
 
         let peers = peers
             .into_iter()
@@ -94,7 +101,7 @@ impl<T: LogStorage> Node<T> {
             .collect();
 
         Ok(Self {
-            raft_group: raft,
+            raft_group,
             peers,
             next_command_id: u64::MIN,
             pending_commands: HashMap::new(),
@@ -124,7 +131,7 @@ impl<T: LogStorage> Node<T> {
                     match message {
                         Some(Message::RaftMessages(messages)) => {
                             for message in messages {
-                                self.raft_group.step(message)?;
+                                self.raft_group.step(message).await?;
                             }
                             self.on_ready().await?;
                         }
@@ -141,7 +148,7 @@ impl<T: LogStorage> Node<T> {
                             // fairly expensive, because we end writing the read down on disk,
                             // turning every read into a write. Ideally, reads are done outside of
                             // Raft to avoid this expense.
-                            match self.raft_group.propose(command_context.into_bytes(), command.into_bytes().to_vec()) {
+                            match self.raft_group.propose(command_context.into_bytes(), command.into_bytes().to_vec()).await {
                                 Ok(()) => {
                                     let previous = self.pending_commands.insert(command_id, response_tx);
                                     assert!(previous.is_none(), "command ID reuse");
@@ -198,7 +205,7 @@ impl<T: LogStorage> Node<T> {
                 }
 
                 () = tokio::time::sleep(timeout) => {
-                    if self.raft_group.tick() {
+                    if self.raft_group.tick().await {
                         self.on_ready().await?;
                     }
                     timeout = self.raft_tick_interval;
@@ -212,8 +219,8 @@ impl<T: LogStorage> Node<T> {
     }
 
     async fn on_ready(&mut self) -> Result<()> {
-        while self.raft_group.has_ready() {
-            let mut ready = self.raft_group.ready();
+        while self.raft_group.has_ready().await {
+            let mut ready = self.raft_group.ready().await;
 
             // Handle ready tasks.
             self.handle_messages(ready.take_messages()).await?;
@@ -223,7 +230,7 @@ impl<T: LogStorage> Node<T> {
             self.handle_committed_entries(ready.take_committed_entries())
                 .await?;
             if !ready.entries().is_empty() {
-                self.mut_store().append(ready.entries()).await?;
+                self.mut_store().append(ready.take_entries()).await?;
             }
             if let Some(hard_state) = ready.hs() {
                 self.mut_store().set_hard_state(hard_state.clone()).await?;
@@ -232,7 +239,7 @@ impl<T: LogStorage> Node<T> {
                 .await?;
 
             // Advance the Raft state machine.
-            let mut light_ready = self.raft_group.advance(ready);
+            let mut light_ready = self.raft_group.advance(ready).await;
 
             // Handle light-ready tasks.
             if let Some(commit_index) = light_ready.commit_index() {
@@ -243,7 +250,7 @@ impl<T: LogStorage> Node<T> {
                 .await?;
 
             // Advance the Raft state machine again.
-            self.raft_group.advance_apply();
+            self.raft_group.advance_apply().await;
         }
 
         Ok(())
@@ -301,7 +308,7 @@ impl<T: LogStorage> Node<T> {
 
                 let command_context = CommandContext::from_bytes(&entry.context);
                 if let Ok(command_context) = command_context
-                    && command_context.node_id == self.raft_group.raft.id
+                    && command_context.node_id == self.raft_group.id()
                     && let Some(response_tx) =
                         self.pending_commands.remove(&command_context.command_id)
                 {
@@ -320,14 +327,14 @@ impl<T: LogStorage> Node<T> {
             .checked_add(1)
             .ok_or("command ID overflow")?;
         Ok(CommandContext::new(
-            self.raft_group.raft.id,
+            self.raft_group.id(),
             command_id,
             command_kind,
         ))
     }
 
-    fn mut_store(&mut self) -> &mut T {
-        self.raft_group.raft.raft_log.mut_store()
+    fn mut_store(&mut self) -> AsyncLogStorage<'_, T> {
+        self.raft_group.mut_store()
     }
 }
 
@@ -462,7 +469,7 @@ impl CommandContext {
 /// # Errors
 ///
 /// Returns an error if the Raft node fails to initialize.
-pub async fn initialize<T: LogStorage>(
+pub async fn initialize<T: LogStorage + Send + 'static>(
     id: u64,
     peers: HashMap<u64, Uri>,
     raft_tick_interval: Duration,
