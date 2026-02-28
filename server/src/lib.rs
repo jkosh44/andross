@@ -19,6 +19,7 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, Uri};
 pub use util::parse_uri;
 
+mod async_raft_group;
 mod encodings;
 pub mod log_storage;
 pub mod raft_node;
