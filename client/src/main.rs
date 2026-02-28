@@ -1,5 +1,5 @@
 use andross_client::Client;
-use andross_server::parse_uri;
+use andross_server::util::parse_uri;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 

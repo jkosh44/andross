@@ -28,6 +28,9 @@ tonic-prost-build = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
+turmoil = { workspace = true }
+tower = { workspace = true }
+hyper-util = { workspace = true }
 
 [lints]
 workspace = true

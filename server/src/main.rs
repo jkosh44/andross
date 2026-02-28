@@ -1,5 +1,6 @@
 use andross_server::log_storage::FileStorage;
-use andross_server::{AddrConfig, AndrossConfig, Result, parse_uri, start_server};
+use andross_server::util::parse_uri;
+use andross_server::{AddrConfig, AndrossConfig, Result, start_server};
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::PathBuf;

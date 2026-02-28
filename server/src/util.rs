@@ -1,5 +1,7 @@
 //! Various utilities.
 
+use crate::simulation::TcpListener;
+use tokio::io;
 use tonic::codegen::http::uri::InvalidUri;
 use tonic::transport::Uri;
 
@@ -19,4 +21,9 @@ pub fn usize_to_u64(n: usize) -> u64 {
 /// Returns an error if the `addr` could not be parsed into a [`Uri`].
 pub fn parse_uri(addr: &str) -> Result<Uri, InvalidUri> {
     format!("http://{addr}").parse::<Uri>()
+}
+
+/// Returns a [`TcpListener`] that listens on any available port.
+pub async fn any_port_listener() -> io::Result<TcpListener> {
+    TcpListener::bind("[::1]:0").await
 }

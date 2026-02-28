@@ -28,6 +28,9 @@ thiserror = "2.0.18"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "fs"] }
 tokio-util = "0.7"
 tonic = "0.14"
+turmoil = "0.7"
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 
