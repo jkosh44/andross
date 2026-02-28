@@ -52,8 +52,8 @@ pub struct NodeConfig<T: LogStorage> {
     rx: mpsc::UnboundedReceiver<Message>,
 }
 
-pub struct Node<T: LogStorage> {
-    raft_group: AsyncRawNode<T>,
+pub struct Node {
+    raft_group: AsyncRawNode,
     peers: HashMap<u64, PeerClient>,
 
     next_command_id: u64,
@@ -67,8 +67,8 @@ pub struct Node<T: LogStorage> {
     rx: mpsc::UnboundedReceiver<Message>,
 }
 
-impl<T: LogStorage + Send + 'static> Node<T> {
-    async fn new(
+impl Node {
+    async fn new<T: LogStorage + Send + 'static>(
         NodeConfig {
             id,
             peers,
@@ -333,7 +333,7 @@ impl<T: LogStorage + Send + 'static> Node<T> {
         ))
     }
 
-    fn mut_store(&mut self) -> AsyncLogStorage<'_, T> {
+    fn mut_store(&mut self) -> AsyncLogStorage<'_> {
         self.raft_group.mut_store()
     }
 }
@@ -476,7 +476,7 @@ pub async fn initialize<T: LogStorage + Send + 'static>(
     default_request_timeout: Duration,
     log_storage: T,
     db: fjall::Database,
-) -> Result<(Node<T>, NodeHandle)> {
+) -> Result<(Node, NodeHandle)> {
     let (tx, rx) = mpsc::unbounded_channel();
     let node_config = NodeConfig {
         id,
