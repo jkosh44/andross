@@ -45,12 +45,11 @@
 //! - Variable length payload as specified by `Data Length` in the header.
 
 use crate::Result;
-use crate::log_storage::LogStorage;
-use crate::util::u64_to_usize;
-use bytes::Bytes;
-use protobuf::{CachedSize, ProtobufEnum, UnknownFields};
+use crate::log_storage::{
+    ENTRY_HEADER_SIZE, Entry, EntryHeader, HARD_STATE_SIZE, HardState, LogStorage,
+};
+use crate::util::{u64_to_usize, usize_to_u64};
 use raft::eraftpb::{ConfState, Snapshot};
-use raft::prelude::EntryType;
 use raft::{GetEntriesContext, RaftState};
 use std::cmp::Ordering;
 use std::fs::File;
@@ -259,12 +258,12 @@ impl FileStorage {
         // before all the information was written. Therefore, we delete the file and
         // start over.
         let file_len = file.metadata()?.len();
-        if file_len != HARD_STATE_FILE_SIZE as u64 {
+        if file_len != usize_to_u64(HARD_STATE_SIZE) {
             assert_eq!(file_len, 0);
             return Ok(None);
         }
 
-        let mut bytes = Vec::with_capacity(HARD_STATE_FILE_SIZE);
+        let mut bytes = Vec::with_capacity(HARD_STATE_SIZE);
         file.read_to_end(&mut bytes)?;
 
         let hard_state = HardState::from_bytes(&bytes).expect("file size checked");
@@ -281,7 +280,7 @@ impl FileStorage {
 
         // Truncate any torn writes.
         let mut file_len = file.metadata()?.len();
-        let torn_write_len = file_len % LOG_FILE_ENTRY_SIZE as u64;
+        let torn_write_len = file_len % usize_to_u64(LOG_FILE_ENTRY_SIZE);
         if torn_write_len > 0 {
             file_len -= torn_write_len;
             file.set_len(file_len)?;
@@ -511,75 +510,6 @@ impl LogStorage for FileStorage {
     }
 }
 
-/// Size in bytes of the hard state file.
-const HARD_STATE_FILE_SIZE: usize = size_of::<u64>() * 3;
-
-/// Represents the Raft hard state to be persisted.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct HardState {
-    commit: u64,
-    term: u64,
-    vote: u64,
-}
-
-impl HardState {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(HARD_STATE_FILE_SIZE);
-        bytes.extend_from_slice(&self.commit.to_le_bytes());
-        bytes.extend_from_slice(&self.term.to_le_bytes());
-        bytes.extend_from_slice(&self.vote.to_le_bytes());
-        bytes
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let (commit_bytes, rest_bytes) = bytes
-            .split_first_chunk()
-            .ok_or_else(|| format!("invalid hard state: {bytes:?}"))?;
-        let (term_bytes, vote_bytes) = rest_bytes
-            .split_first_chunk()
-            .ok_or_else(|| format!("invalid hard state: {rest_bytes:?}"))?;
-        let vote_bytes: [u8; size_of::<u64>()] = vote_bytes
-            .try_into()
-            .map_err(|_| format!("invalid hard state: {rest_bytes:?}"))?;
-
-        let commit = u64::from_le_bytes(*commit_bytes);
-        let term = u64::from_le_bytes(*term_bytes);
-        let vote = u64::from_le_bytes(vote_bytes);
-
-        Ok(Self { commit, term, vote })
-    }
-}
-
-impl From<raft::prelude::HardState> for HardState {
-    fn from(hard_state: raft::eraftpb::HardState) -> Self {
-        Self {
-            commit: hard_state.commit,
-            term: hard_state.term,
-            vote: hard_state.vote,
-        }
-    }
-}
-
-impl From<&raft::prelude::HardState> for HardState {
-    fn from(hard_state: &raft::eraftpb::HardState) -> Self {
-        Self {
-            commit: hard_state.commit,
-            term: hard_state.term,
-            vote: hard_state.vote,
-        }
-    }
-}
-
-impl From<HardState> for raft::prelude::HardState {
-    fn from(HardState { commit, term, vote }: HardState) -> Self {
-        let mut hard_state = raft::prelude::HardState::new();
-        hard_state.commit = commit;
-        hard_state.term = term;
-        hard_state.vote = vote;
-        hard_state
-    }
-}
-
 /// Directory of log files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Directory {
@@ -645,147 +575,18 @@ impl LogFileEntry {
     }
 }
 
-/// Represents a single Raft log entry.
-#[derive(Debug)]
-struct Entry {
-    #[expect(clippy::struct_field_names)]
-    entry_type: i32,
-    term: u64,
-    index: u64,
-    data: Bytes,
-    context: Bytes,
-}
-
-impl Entry {
-    fn header(&self) -> EntryHeader {
-        EntryHeader {
-            entry_type: self.entry_type,
-            term: self.term,
-            index: self.index,
-            data_len: self.data.len() as u64,
-            context_len: self.context.len() as u64,
-        }
-    }
-}
-
-impl From<raft::prelude::Entry> for Entry {
-    fn from(entry: raft::eraftpb::Entry) -> Self {
-        (&entry).into()
-    }
-}
-
-impl From<&raft::prelude::Entry> for Entry {
-    fn from(entry: &raft::eraftpb::Entry) -> Self {
-        Self {
-            entry_type: entry.entry_type.value(),
-            term: entry.term,
-            index: entry.index,
-            data: entry.data.clone(),
-            context: entry.context.clone(),
-        }
-    }
-}
-
-impl TryFrom<Entry> for raft::prelude::Entry {
-    type Error = String;
-
-    fn try_from(entry: Entry) -> std::result::Result<Self, Self::Error> {
-        (&entry).try_into()
-    }
-}
-
-impl TryFrom<&Entry> for raft::prelude::Entry {
-    type Error = String;
-
-    fn try_from(entry: &Entry) -> std::result::Result<Self, Self::Error> {
-        Ok(raft::prelude::Entry {
-            entry_type: EntryType::from_i32(entry.entry_type)
-                .ok_or_else(|| format!("invalid entry type: {}", entry.entry_type))?,
-            term: entry.term,
-            index: entry.index,
-            data: entry.data.clone(),
-            context: entry.context.clone(),
-            sync_log: false,
-            unknown_fields: UnknownFields::default(),
-            cached_size: CachedSize::default(),
-        })
-    }
-}
-
-/// Size in bytes of the header of a log entry.
-const ENTRY_HEADER_SIZE: usize = size_of::<i32>() + size_of::<u64>() * 4;
-
-/// Header for a log entry stored on disk.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct EntryHeader {
-    entry_type: i32,
-    term: u64,
-    index: u64,
-    data_len: u64,
-    context_len: u64,
-}
-
-impl EntryHeader {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(ENTRY_HEADER_SIZE);
-        bytes.extend_from_slice(&self.entry_type.to_le_bytes());
-        bytes.extend_from_slice(&self.term.to_le_bytes());
-        bytes.extend_from_slice(&self.index.to_le_bytes());
-        bytes.extend_from_slice(&self.data_len.to_le_bytes());
-        bytes.extend_from_slice(&self.context_len.to_le_bytes());
-        bytes
-    }
-
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let (entry_type_bytes, rest_bytes) = bytes
-            .split_first_chunk()
-            .ok_or_else(|| format!("invalid log entry header: {bytes:?}"))?;
-        let (term_bytes, rest_bytes) = rest_bytes
-            .split_first_chunk()
-            .ok_or_else(|| format!("invalid log entry header: {bytes:?}"))?;
-        let (index_bytes, rest_bytes) = rest_bytes
-            .split_first_chunk()
-            .ok_or_else(|| format!("invalid log entry header: {bytes:?}"))?;
-        let (data_len_bytes, context_len_bytes) = rest_bytes
-            .split_first_chunk()
-            .ok_or_else(|| format!("invalid log entry header: {bytes:?}"))?;
-        let context_len_bytes: [u8; size_of::<u64>()] = context_len_bytes
-            .try_into()
-            .map_err(|_| format!("invalid log file entry header: {bytes:?}"))?;
-
-        let entry_type = i32::from_le_bytes(*entry_type_bytes);
-        let term = u64::from_le_bytes(*term_bytes);
-        let index = u64::from_le_bytes(*index_bytes);
-        let data_len = u64::from_le_bytes(*data_len_bytes);
-        let context_len = u64::from_le_bytes(context_len_bytes);
-
-        Ok(Self {
-            entry_type,
-            term,
-            index,
-            data_len,
-            context_len,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::util::usize_to_u64;
+    use bytes::Bytes;
     use proptest::prelude::*;
+    use protobuf::ProtobufEnum;
     use raft::Storage;
+    use raft::prelude::EntryType;
     use tempfile::TempDir;
 
     proptest! {
-        #[test]
-        fn test_hard_state_roundtrip(commit in any::<u64>(), term in any::<u64>(), vote in any::<u64>()) {
-            let hs = HardState { commit, term, vote };
-            let bytes = hs.to_bytes();
-            let hs2 = HardState::from_bytes(&bytes).unwrap();
-            assert_eq!(hs, hs2);
-        }
-
         #[test]
         fn test_log_file_entry_roundtrip(id in any::<u64>(), start_index in any::<u64>()) {
             let lfe = LogFileEntry { id, start_index };
@@ -802,20 +603,6 @@ mod tests {
             let bytes = directory.to_bytes();
             let directory2 = Directory::from_bytes(&bytes).unwrap();
             assert_eq!(directory, directory2);
-        }
-
-        #[test]
-        fn test_entry_header_roundtrip(entry_type in any::<i32>(), term in any::<u64>(), index in any::<u64>(), data_len in any::<u64>()) {
-            let header = EntryHeader {
-                entry_type,
-                term,
-                index,
-                data_len,
-                context_len: 0,
-            };
-            let bytes = header.to_bytes();
-            let header2 = EntryHeader::from_bytes(&bytes).unwrap();
-            assert_eq!(header, header2);
         }
     }
 
