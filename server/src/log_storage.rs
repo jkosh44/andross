@@ -4,13 +4,14 @@
 //! with initialization and update methods.
 
 mod file_storage;
+mod fjall_storage;
 
 use crate::Result;
-#[cfg(test)]
 use crate::util::u64_to_usize;
 use crate::util::usize_to_u64;
 use bytes::Bytes;
 pub use file_storage::FileStorage;
+pub use fjall_storage::FjallStorage;
 #[cfg(test)]
 use proptest::prelude::{Strategy, any};
 #[cfg(test)]
@@ -19,7 +20,6 @@ use protobuf::{CachedSize, ProtobufEnum, UnknownFields};
 use raft::eraftpb::EntryType;
 use raft::prelude::ConfState;
 use raft::storage::MemStorage;
-use tokio::io;
 
 /// An extension trait for [`raft::storage::Storage`].
 pub trait LogStorage: raft::prelude::Storage {
@@ -40,14 +40,14 @@ pub trait LogStorage: raft::prelude::Storage {
     /// # Errors
     ///
     /// Returns an error if the hard state could not be updated.
-    fn set_hard_state(&mut self, hard_state: raft::prelude::HardState) -> io::Result<()>;
+    fn set_hard_state(&mut self, hard_state: raft::prelude::HardState) -> raft::Result<()>;
 
     /// Sets the commit index.
     ///
     /// # Errors
     ///
     /// Returns an error if the commit index could not be updated.
-    fn set_commit_index(&mut self, commit_index: u64) -> io::Result<()>;
+    fn set_commit_index(&mut self, commit_index: u64) -> raft::Result<()>;
 }
 
 impl LogStorage for MemStorage {
@@ -59,12 +59,12 @@ impl LogStorage for MemStorage {
         self.wl().append(entries)
     }
 
-    fn set_hard_state(&mut self, hard_state: raft::prelude::HardState) -> io::Result<()> {
+    fn set_hard_state(&mut self, hard_state: raft::prelude::HardState) -> raft::Result<()> {
         self.wl().set_hardstate(hard_state);
         Ok(())
     }
 
-    fn set_commit_index(&mut self, commit_index: u64) -> io::Result<()> {
+    fn set_commit_index(&mut self, commit_index: u64) -> raft::Result<()> {
         self.wl().mut_hard_state().set_commit(commit_index);
         Ok(())
     }
@@ -173,7 +173,6 @@ impl Entry {
         }
     }
 
-    #[cfg(test)]
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes =
             Vec::with_capacity(ENTRY_HEADER_SIZE + self.data.len() + self.context.len());
@@ -184,7 +183,6 @@ impl Entry {
         bytes
     }
 
-    #[cfg(test)]
     fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (header_bytes, rest_bytes) = (&bytes[..ENTRY_HEADER_SIZE], &bytes[ENTRY_HEADER_SIZE..]);
         let EntryHeader {

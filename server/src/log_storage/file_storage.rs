@@ -485,12 +485,13 @@ impl LogStorage for FileStorage {
         Ok(())
     }
 
-    fn set_hard_state(&mut self, hard_state: raft::prelude::HardState) -> io::Result<()> {
+    fn set_hard_state(&mut self, hard_state: raft::prelude::HardState) -> raft::Result<()> {
         self.raft_state.hard_state = hard_state;
-        self.persist_hard_state()
+        self.persist_hard_state()?;
+        Ok(())
     }
 
-    fn set_commit_index(&mut self, commit_index: u64) -> io::Result<()> {
+    fn set_commit_index(&mut self, commit_index: u64) -> raft::Result<()> {
         self.raft_state.hard_state.commit = commit_index;
 
         let mut file = File::options()
