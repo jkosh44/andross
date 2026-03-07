@@ -10,7 +10,6 @@
 use crate::log_storage::LogStorage;
 use raft::eraftpb::{Entry, HardState, Message};
 use raft::{LightReady, RawNode, Ready};
-use tokio::io;
 use tokio::sync::{mpsc, oneshot};
 
 enum RawNodeMessage {
@@ -45,11 +44,11 @@ enum RawNodeMessage {
     },
     SetHardState {
         hard_state: HardState,
-        response_tx: oneshot::Sender<io::Result<()>>,
+        response_tx: oneshot::Sender<raft::Result<()>>,
     },
     SetCommitIndex {
         commit_index: u64,
-        response_tx: oneshot::Sender<io::Result<()>>,
+        response_tx: oneshot::Sender<raft::Result<()>>,
     },
 }
 
@@ -158,7 +157,7 @@ impl<'a> AsyncLogStorage<'a> {
     }
 
     /// See [`LogStorage::set_hard_state`].
-    pub(crate) async fn set_hard_state(&mut self, hard_state: HardState) -> io::Result<()> {
+    pub(crate) async fn set_hard_state(&mut self, hard_state: HardState) -> raft::Result<()> {
         self.async_raw_node
             .execute(|response_tx| RawNodeMessage::SetHardState {
                 hard_state,
@@ -168,7 +167,7 @@ impl<'a> AsyncLogStorage<'a> {
     }
 
     /// See [`LogStorage::set_commit_index`].
-    pub(crate) async fn set_commit_index(&mut self, commit_index: u64) -> io::Result<()> {
+    pub(crate) async fn set_commit_index(&mut self, commit_index: u64) -> raft::Result<()> {
         self.async_raw_node
             .execute(|response_tx| RawNodeMessage::SetCommitIndex {
                 commit_index,

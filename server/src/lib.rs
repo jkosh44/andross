@@ -9,6 +9,7 @@ use crate::service::kv_service_server::KvServiceServer;
 use crate::service::raft_service_server::RaftServiceServer;
 pub use encodings::{Command, Tuple};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -124,16 +125,13 @@ pub async fn start_server<T: LogStorage + Send + 'static>(
 
 pub async fn test_database() -> (fjall::Database, TempDir) {
     let temp_dir = tempfile::tempdir().unwrap();
-    let path = temp_dir.path().to_path_buf();
-    let db = spawn_blocking(move || {
-        fjall::Database::builder(&path)
-            .manual_journal_persist(true)
-            .temporary(true)
-            .open()
-    })
-    .await
-    .expect("thread panicked")
-    .unwrap();
-
+    let db = test_database_from_state(temp_dir.path().to_path_buf()).await;
     (db, temp_dir)
+}
+
+pub async fn test_database_from_state(path: PathBuf) -> fjall::Database {
+    spawn_blocking(move || fjall::Database::builder(path).open())
+        .await
+        .expect("thread panicked")
+        .unwrap()
 }
