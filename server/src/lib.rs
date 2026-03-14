@@ -76,7 +76,7 @@ pub async fn start_server<T: LogStorage + Send + 'static>(
     .await?;
 
     let node_cancellation_token = cancellation_token.clone();
-    let server_cancellation_toke = cancellation_token.clone();
+    let server_cancellation_token = cancellation_token.clone();
     let mut node_join_handle = tokio::spawn(async move { node.run(node_cancellation_token).await });
     let mut server_join_handle: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
         let builder = Server::builder()
@@ -88,14 +88,14 @@ pub async fn start_server<T: LogStorage + Send + 'static>(
             AddrConfig::Port(port) => {
                 let addr = format!("[::1]:{port}").parse()?;
                 builder
-                    .serve_with_shutdown(addr, server_cancellation_toke.cancelled())
+                    .serve_with_shutdown(addr, server_cancellation_token.cancelled())
                     .await?;
                 Ok(())
             }
             AddrConfig::TcpListener(tcp_listener) => {
                 let incoming = TcpIncoming::from(tcp_listener).with_nodelay(Some(true));
                 builder
-                    .serve_with_incoming_shutdown(incoming, server_cancellation_toke.cancelled())
+                    .serve_with_incoming_shutdown(incoming, server_cancellation_token.cancelled())
                     .await?;
                 Ok(())
             }
