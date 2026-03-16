@@ -40,8 +40,8 @@ impl ServerHandle {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn test_three_node_cluster() {
-    const NUM_SERVERS: usize = 3;
+async fn test_five_node_cluster() {
+    const NUM_SERVERS: usize = 5;
 
     // Start all servers.
     let mut servers = start_servers(ServerInitState::Num(NUM_SERVERS)).await;

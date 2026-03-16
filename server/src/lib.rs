@@ -4,7 +4,7 @@
 //! including the Raft consensus protocol implementation and storage abstractions.
 
 use crate::log_storage::LogStorage;
-use crate::raft_node::initialize;
+use crate::raft_node::{GrpcPeerClient, initialize};
 use crate::service::kv_service_server::KvServiceServer;
 use crate::service::raft_service_server::RaftServiceServer;
 pub use encodings::{Command, Tuple};
@@ -65,9 +65,10 @@ pub async fn start_server<T: LogStorage + Send + 'static>(
         cancellation_token,
     }: AndrossConfig<T>,
 ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let (node, node_handle) = initialize(
+    let (node, node_handle) = initialize::<T, _, _>(
         id,
         peers,
+        GrpcPeerClient::new,
         raft_tick_interval,
         default_request_timeout,
         log_storage,
