@@ -1,4 +1,4 @@
-use crate::util::u64_to_usize;
+use crate::util::{u64_to_usize, usize_to_u64};
 use bytes::Bytes;
 #[cfg(test)]
 use proptest_derive::Arbitrary;
@@ -18,7 +18,7 @@ impl Command {
     pub fn insert(key: &[u8], value: &[u8]) -> Self {
         let mut bytes = Vec::with_capacity(1 + size_of::<u64>() + key.len() + value.len());
         bytes.push(CommandKind::Insert as u8);
-        let key_len = key.len() as u64;
+        let key_len = usize_to_u64(key.len());
         bytes.extend_from_slice(&key_len.to_be_bytes());
         bytes.extend_from_slice(key);
         bytes.extend_from_slice(value);
@@ -46,6 +46,39 @@ impl Command {
         Self {
             bytes,
             command_inner: CommandInner::Read { key },
+        }
+    }
+
+    /// Creates a new [`Command`] that corresponds to a cas operation.
+    #[must_use]
+    pub fn cas(key: &[u8], expected_value: &[u8], desired_value: &[u8]) -> Self {
+        let mut bytes = Vec::with_capacity(
+            1 + size_of::<u64>()
+                + key.len()
+                + size_of::<u64>()
+                + expected_value.len()
+                + desired_value.len(),
+        );
+        bytes.push(CommandKind::Cas as u8);
+
+        let key_len = usize_to_u64(key.len());
+        bytes.extend_from_slice(&key_len.to_le_bytes());
+        bytes.extend_from_slice(key);
+
+        let expected_value_len = usize_to_u64(expected_value.len());
+        bytes.extend_from_slice(&expected_value_len.to_le_bytes());
+        bytes.extend_from_slice(expected_value);
+
+        bytes.extend_from_slice(desired_value);
+
+        let bytes = Bytes::from(bytes);
+
+        let cas_tuple = bytes.slice(1..);
+        let cas_tuple = CasTuple::new(cas_tuple).expect("cas tuple bytes are valid");
+
+        Self {
+            bytes,
+            command_inner: CommandInner::Cas { cas_tuple },
         }
     }
 
@@ -78,6 +111,15 @@ impl Command {
                     command_inner: CommandInner::Read { key },
                 })
             }
+            CommandKind::Cas => {
+                let cas_tuple = bytes.slice(1..);
+                let cas_tuple = CasTuple::new(cas_tuple)
+                    .map_err(|_| format!("CAS command bytes malformed: {bytes:?}"))?;
+                Ok(Self {
+                    bytes,
+                    command_inner: CommandInner::Cas { cas_tuple },
+                })
+            }
         }
     }
 
@@ -86,6 +128,7 @@ impl Command {
         match self.command_inner {
             CommandInner::Insert { .. } => CommandKind::Insert,
             CommandInner::Read { .. } => CommandKind::Read,
+            CommandInner::Cas { .. } => CommandKind::Cas,
         }
     }
 
@@ -99,6 +142,7 @@ impl Command {
 pub(crate) enum CommandInner {
     Insert { tuple: Tuple },
     Read { key: Bytes },
+    Cas { cas_tuple: CasTuple },
 }
 
 /// Represents the type of command in a system, as an u8 enumeration.
@@ -108,6 +152,7 @@ pub(crate) enum CommandInner {
 pub enum CommandKind {
     Insert = 0,
     Read = 1,
+    Cas = 2,
 }
 
 impl From<CommandKind> for u8 {
@@ -123,6 +168,7 @@ impl TryFrom<u8> for CommandKind {
         match value {
             0 => Ok(CommandKind::Insert),
             1 => Ok(CommandKind::Read),
+            2 => Ok(CommandKind::Cas),
             _ => Err(format!("Invalid command kind: {value}")),
         }
     }
@@ -170,9 +216,86 @@ impl Tuple {
         let value = self.bytes.slice(size_of::<u64>() + key_len..);
         (key, value)
     }
+}
 
-    /// Converts a [`Tuple`] into the inner bytes.
-    pub fn into_bytes(self) -> Bytes {
-        self.bytes
+/// Represents a key, expected value, and desired value.
+///
+/// A [`CasTuple`] has the following layout:
+/// | Offset                                     | Length              | Description           |
+/// |--------------------------------------------|---------------------|-----------------------|
+/// | 0                                          | 8                   | Key Length            |
+/// | 8                                          | Key Length          | Key                   |
+/// | 8 + Key Length                             | 8                   | Expected Value Length |
+/// | 8 + Key Length + 8                         | Expect Value Length | Expected Value        |
+/// | 8 + Key Length + 8 + Expected Value Length | To end              | Desired Value         |
+#[derive(Clone, Debug)]
+pub struct CasTuple {
+    bytes: Bytes,
+}
+
+impl CasTuple {
+    /// Creates a new [`CasTuple`] from raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the bytes are malformed.
+    pub fn new(bytes: Bytes) -> Result<Self, String> {
+        if bytes.len() < size_of::<u64>() {
+            return Err(format!("Tuple bytes too short: {bytes:?}"));
+        }
+        let key_len_bytes = &bytes[..size_of::<u64>()];
+        let rest = &bytes[size_of::<u64>()..];
+        let key_len = u64::from_le_bytes(key_len_bytes.try_into().expect("size checked above"));
+        let key_len = u64_to_usize(key_len);
+
+        if rest.len() < key_len {
+            return Err(format!("Tuple bytes malformed: {bytes:?}"));
+        }
+        let rest = &rest[key_len..];
+
+        if rest.len() < size_of::<u64>() {
+            return Err(format!("Tuple bytes too short: {bytes:?}"));
+        }
+        let expected_value_len_bytes = &rest[..size_of::<u64>()];
+        let rest = &rest[size_of::<u64>()..];
+        let expected_value_len = u64::from_le_bytes(
+            expected_value_len_bytes
+                .try_into()
+                .expect("size checked above"),
+        );
+        let expected_value_len = u64_to_usize(expected_value_len);
+
+        if rest.len() < expected_value_len {
+            return Err(format!("Tuple bytes malformed: {bytes:?}"));
+        }
+
+        Ok(Self { bytes })
+    }
+
+    /// Returns the (key, expected value, desired value) bytes of the [`CasTuple`].
+    pub fn to_key_and_values(&self) -> (Bytes, Bytes, Bytes) {
+        let key_len_bytes = &self.bytes[..size_of::<u64>()];
+        let rest = self.bytes.slice(size_of::<u64>()..);
+        let key_len = u64::from_le_bytes(
+            key_len_bytes
+                .try_into()
+                .expect("size checked in constructor"),
+        );
+        let key_len = u64_to_usize(key_len);
+        let key = rest.slice(..key_len);
+        let rest = rest.slice(key_len..);
+
+        let expected_value_len_bytes = &rest[..size_of::<u64>()];
+        let rest = rest.slice(size_of::<u64>()..);
+        let expected_value_len = u64::from_le_bytes(
+            expected_value_len_bytes
+                .try_into()
+                .expect("size checked in constructor"),
+        );
+        let expected_value_len = u64_to_usize(expected_value_len);
+        let expected_value = rest.slice(..expected_value_len);
+        let desired_value = rest.slice(expected_value_len..);
+
+        (key, expected_value, desired_value)
     }
 }
