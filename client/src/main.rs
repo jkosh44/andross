@@ -45,10 +45,11 @@ async fn main() {
             Err(e) => panic!("INSERT FAILED: {e}"),
         },
         Commands::Read { key } => match client.read(key.clone()).await {
-            Ok(value) => match std::str::from_utf8(&value) {
+            Ok(Some(value)) => match std::str::from_utf8(&value) {
                 Ok(value) => println!("VALUE: {value}"),
                 Err(_) => println!("VALUE: {value:?}"),
             },
+            Ok(None) => println!("VALUE not found"),
             Err(e) => panic!("READ FAILED: {e}"),
         },
     }

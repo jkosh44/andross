@@ -295,11 +295,31 @@ impl Node {
                         CommandInner::Insert { tuple } => {
                             let (key, value) = tuple.to_key_value();
                             items.insert(key.as_ref(), value.as_ref())?;
-                            Some(Bytes::new())
+                            None
                         }
                         CommandInner::Read { key } => {
                             let value = items.get(key)?;
                             value.map(|value| value.to_vec().into())
+                        }
+                        CommandInner::Cas { cas_tuple } => {
+                            let (key, expected_value, desired_value) =
+                                cas_tuple.to_key_and_values();
+                            let current_value = items.get(&key)?;
+
+                            let matches_expected = match &current_value {
+                                Some(current_value) => {
+                                    current_value.as_ref() == expected_value.as_ref()
+                                }
+                                None => expected_value.is_empty(),
+                            };
+                            if matches_expected {
+                                items.insert(key.as_ref(), desired_value.as_ref())?;
+                                None
+                            } else {
+                                let current_value = current_value
+                                    .map_or(Bytes::new(), |value| value.to_vec().into());
+                                Some(current_value)
+                            }
                         }
                     };
                     Ok(response)
@@ -532,6 +552,7 @@ mod tests {
             })
         };
 
+        // Insert key-value pair.
         let key = b"k0";
         let value = b"v0";
         let command_bytes = Command::insert(key, value).into_bytes();
@@ -544,7 +565,7 @@ mod tests {
                     assert_eq!(
                         response.into_inner(),
                         CommandResponse {
-                            response_bytes: Some(Bytes::new())
+                            response_bytes: None
                         }
                     );
 
@@ -554,6 +575,53 @@ mod tests {
                     let CommandResponse { response_bytes } =
                         node_handle.command(request).await.unwrap().into_inner();
                     assert_eq!(response_bytes, Some(value.as_ref().into()));
+
+                    // Fail to CAS.
+                    let command_bytes = Command::cas(key, b"v7", b"v1").into_bytes();
+                    let request = Request::new(CommandRequest { command_bytes });
+                    let CommandResponse { response_bytes } =
+                        node_handle.command(request).await.unwrap().into_inner();
+                    assert_eq!(response_bytes, Some(value.as_ref().into()));
+
+                    // Successfully CAS.
+                    let desired_value = b"v2";
+                    let command_bytes = Command::cas(key, value, desired_value).into_bytes();
+                    let request = Request::new(CommandRequest { command_bytes });
+                    let CommandResponse { response_bytes } =
+                        node_handle.command(request).await.unwrap().into_inner();
+                    assert_eq!(response_bytes, None);
+
+                    // Read the value back.
+                    let command_bytes = Command::read(key).into_bytes();
+                    let request = Request::new(CommandRequest { command_bytes });
+                    let CommandResponse { response_bytes } =
+                        node_handle.command(request).await.unwrap().into_inner();
+                    assert_eq!(response_bytes, Some(desired_value.as_ref().into()));
+
+                    // Fail to CAS empty key
+                    let key = b"k1";
+                    let desired_value = b"v3";
+                    let command_bytes = Command::cas(key, b"42", desired_value).into_bytes();
+                    let request = Request::new(CommandRequest { command_bytes });
+                    let CommandResponse { response_bytes } =
+                        node_handle.command(request).await.unwrap().into_inner();
+                    assert_eq!(response_bytes, Some(Bytes::new()));
+
+                    // Successfully CAS empty key
+                    let key = b"k1";
+                    let desired_value = b"v3";
+                    let command_bytes = Command::cas(key, b"", desired_value).into_bytes();
+                    let request = Request::new(CommandRequest { command_bytes });
+                    let CommandResponse { response_bytes } =
+                        node_handle.command(request).await.unwrap().into_inner();
+                    assert_eq!(response_bytes, None);
+
+                    // Read the value back.
+                    let command_bytes = Command::read(key).into_bytes();
+                    let request = Request::new(CommandRequest { command_bytes });
+                    let CommandResponse { response_bytes } =
+                        node_handle.command(request).await.unwrap().into_inner();
+                    assert_eq!(response_bytes, Some(desired_value.as_ref().into()));
 
                     cancellation_token.cancel();
                     task_handle.await.unwrap();

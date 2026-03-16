@@ -48,7 +48,7 @@ impl Client {
         let response_bytes = self
             .retry_command(command, |e| !matches!(e, ClientError::Indeterminate { .. }))
             .await?;
-        assert_eq!(response_bytes, Some(Bytes::new()));
+        assert_eq!(response_bytes, None);
         Ok(())
     }
 
@@ -57,11 +57,30 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the read could not be completed successfully.
-    pub async fn read(&mut self, key: Bytes) -> Result<Bytes, ClientError> {
+    pub async fn read(&mut self, key: Bytes) -> Result<Option<Bytes>, ClientError> {
         let command = Command::read(&key);
         // Retry all errors.
         let response_bytes = self.retry_command(command, |_| true).await?;
-        let response_bytes = response_bytes.expect("read command must return a value");
+        Ok(response_bytes)
+    }
+
+    /// Compare the value of `key` to `expected_valued` and swap with `desired_value` if it matches.
+    /// Returns the previous value if it was swapped, otherwise returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cas could not be completed successfully.
+    pub async fn cas(
+        &mut self,
+        key: Bytes,
+        expected_value: Bytes,
+        desired_value: Bytes,
+    ) -> Result<Option<Bytes>, ClientError> {
+        let command = Command::cas(&key, &expected_value, &desired_value);
+        // Do not retry indeterminate errors.
+        let response_bytes = self
+            .retry_command(command, |e| !matches!(e, ClientError::Indeterminate { .. }))
+            .await?;
         Ok(response_bytes)
     }
 

@@ -4,6 +4,7 @@ use andross_server::{
     AddrConfig, AndrossConfig, Command, parse_uri, start_server, test_database,
     test_database_from_state,
 };
+use bytes::Bytes;
 use raft::storage::MemStorage;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -37,6 +38,7 @@ impl ServerHandle {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_three_node_cluster() {
     const NUM_SERVERS: usize = 3;
 
@@ -61,7 +63,7 @@ async fn test_three_node_cluster() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(response_bytes, Some(Vec::new().into()));
+    assert_eq!(response_bytes, None);
 
     // Read the value back from all nodes.
     for ServerHandle { client, .. } in &mut servers {
@@ -73,6 +75,87 @@ async fn test_three_node_cluster() {
             .unwrap()
             .into_inner();
         assert_eq!(response_bytes, Some(value.to_vec().into()));
+    }
+
+    // Fail to CAS.
+    let command_bytes = Command::cas(key, b"v7", b"v1").into_bytes();
+    let request = CommandRequest { command_bytes };
+    let CommandResponse { response_bytes } = servers
+        .first_mut()
+        .unwrap()
+        .client
+        .command(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response_bytes, Some(value.as_ref().into()));
+
+    // Successfully CAS.
+    let desired_value = b"v2";
+    let command_bytes = Command::cas(key, value, desired_value).into_bytes();
+    let request = CommandRequest { command_bytes };
+    let CommandResponse { response_bytes } = servers
+        .first_mut()
+        .unwrap()
+        .client
+        .command(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response_bytes, None);
+
+    // Read the value back from all nodes.
+    for ServerHandle { client, .. } in &mut servers {
+        let command_bytes = Command::read(key).into_bytes();
+        let request = CommandRequest { command_bytes };
+        let CommandResponse { response_bytes } = client
+            .command(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response_bytes, Some(desired_value.to_vec().into()));
+    }
+
+    // Fail to CAS empty key
+    let key = b"k1";
+    let desired_value = b"v3";
+    let command_bytes = Command::cas(key, b"42", desired_value).into_bytes();
+    let request = CommandRequest { command_bytes };
+    let CommandResponse { response_bytes } = servers
+        .first_mut()
+        .unwrap()
+        .client
+        .command(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response_bytes, Some(Bytes::new()));
+
+    // Successfully CAS empty key
+    let key = b"k1";
+    let desired_value = b"v3";
+    let command_bytes = Command::cas(key, b"", desired_value).into_bytes();
+    let request = CommandRequest { command_bytes };
+    let CommandResponse { response_bytes } = servers
+        .first_mut()
+        .unwrap()
+        .client
+        .command(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response_bytes, None);
+
+    // Read the value back from all nodes.
+    for ServerHandle { client, .. } in &mut servers {
+        let command_bytes = Command::read(key).into_bytes();
+        let request = CommandRequest { command_bytes };
+        let CommandResponse { response_bytes } = client
+            .command(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response_bytes, Some(desired_value.to_vec().into()));
     }
 
     // Shut down all nodes.
@@ -104,7 +187,7 @@ async fn test_three_node_cluster() {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(response_bytes, Some(value.to_vec().into()));
+        assert_eq!(response_bytes, Some(desired_value.to_vec().into()));
     }
 
     // Shut down all nodes.
