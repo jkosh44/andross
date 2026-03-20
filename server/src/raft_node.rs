@@ -18,7 +18,7 @@ use protobuf::{Message as ProtobufMessage, ProtobufResult};
 use raft::prelude::{ConfState, Entry};
 use raft::{Config, RawNode};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
@@ -122,10 +122,9 @@ impl Node {
     ///
     /// Returns an error if Raft processing fails.
     pub async fn run(mut self, cancellation_token: CancellationToken) -> Result<()> {
-        let mut timeout = self.raft_tick_interval;
+        let mut ticker = tokio::time::interval(self.raft_tick_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let start = Instant::now();
-
             select! {
                 message = self.rx.recv() => {
                     match message {
@@ -201,14 +200,12 @@ impl Node {
                         }
                         None => break,
                     }
-                    timeout = timeout.saturating_sub(start.elapsed());
                 }
 
-                () = tokio::time::sleep(timeout) => {
+                _ = ticker.tick() => {
                     if self.raft_group.tick().await {
                         self.on_ready().await?;
                     }
-                    timeout = self.raft_tick_interval;
                 }
 
                 () = cancellation_token.cancelled() => break,

@@ -1,3 +1,4 @@
+use andross_server::log_storage::FjallStorage;
 use andross_server::service::kv_service_client::KvServiceClient;
 use andross_server::service::{CommandRequest, CommandResponse};
 use andross_server::{
@@ -5,7 +6,7 @@ use andross_server::{
     test_database_from_state,
 };
 use bytes::Bytes;
-use raft::storage::MemStorage;
+use fjall::KeyspaceCreateOptions;
 use std::collections::HashMap;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -252,13 +253,18 @@ async fn start_servers(mut server_init_state: ServerInitState) -> Vec<ServerHand
                 (db, temp_dir)
             }
         };
+        let log_keyspace = db.keyspace("log", KeyspaceCreateOptions::default).unwrap();
+        let hard_state_keyspace = db
+            .keyspace("hard_state", KeyspaceCreateOptions::default)
+            .unwrap();
+        let log_storage = FjallStorage::new(db.clone(), log_keyspace, hard_state_keyspace).unwrap();
         let config = AndrossConfig {
             id: node_id,
             addr_config: AddrConfig::TcpListener(listener),
             peers,
-            raft_tick_interval: Duration::from_millis(1),
+            raft_tick_interval: Duration::from_millis(100),
             default_request_timeout: Duration::from_secs(5),
-            log_storage: MemStorage::new(),
+            log_storage,
             db,
             cancellation_token: cancellation_token.clone(),
         };
