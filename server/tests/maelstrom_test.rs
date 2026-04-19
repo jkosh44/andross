@@ -61,7 +61,7 @@ fn download_maelstrom(crate_root: &Path) -> PathBuf {
         return maelstrom_bin;
     }
 
-    println!("Downloading Maelstrom from {MAELSTROM_URL}",);
+    println!("Downloading Maelstrom from {MAELSTROM_URL}");
     let response = reqwest::blocking::get(MAELSTROM_URL).expect("Failed to download Maelstrom");
     let bytes = response.bytes().expect("Failed to read Maelstrom response");
 

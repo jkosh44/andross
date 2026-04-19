@@ -18,10 +18,11 @@ use protobuf::{Message as ProtobufMessage, ProtobufResult};
 use raft::prelude::{ConfState, Entry};
 use raft::{Config, RawNode};
 use std::collections::HashMap;
+use std::thread;
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Uri};
 use tonic::{Request, Response, Status};
@@ -61,10 +62,11 @@ pub struct Node {
     raft_tick_interval: Duration,
     default_request_timeout: Duration,
 
-    db: fjall::Database,
-
     tx: mpsc::UnboundedSender<Message>,
     rx: mpsc::UnboundedReceiver<Message>,
+
+    wal_applier_tx: mpsc::UnboundedSender<CommittedEntry>,
+    wal_applier_handle: thread::JoinHandle<Result<()>>,
 }
 
 impl Node {
@@ -100,6 +102,10 @@ impl Node {
             .map(|(id, addr)| (id, PeerClient::new(addr)))
             .collect();
 
+        let (wal_applier_tx, wal_applier_rx) = mpsc::unbounded_channel();
+        let wal_applier = WalApplier::new(wal_applier_rx, db);
+        let wal_applier_handle = thread::spawn(move || wal_applier.run());
+
         Ok(Self {
             raft_group,
             peers,
@@ -107,9 +113,10 @@ impl Node {
             pending_commands: HashMap::new(),
             raft_tick_interval,
             default_request_timeout,
-            db,
             tx,
             rx,
+            wal_applier_tx,
+            wal_applier_handle,
         })
     }
 
@@ -212,6 +219,8 @@ impl Node {
             }
         }
 
+        drop(self.wal_applier_tx);
+        spawn_blocking(move || self.wal_applier_handle.join().expect("thread panicked")).await??;
         Ok(())
     }
 
@@ -224,8 +233,7 @@ impl Node {
             if !ready.snapshot().is_empty() {
                 unimplemented!("snapshots are not yet supported");
             }
-            self.handle_committed_entries(ready.take_committed_entries())
-                .await?;
+            self.handle_committed_entries(ready.take_committed_entries());
             if !ready.entries().is_empty() {
                 self.mut_store().append(ready.take_entries()).await?;
             }
@@ -243,8 +251,7 @@ impl Node {
                 self.mut_store().set_commit_index(commit_index).await?;
             }
             self.handle_messages(light_ready.take_messages()).await?;
-            self.handle_committed_entries(light_ready.take_committed_entries())
-                .await?;
+            self.handle_committed_entries(light_ready.take_committed_entries());
 
             // Advance the Raft state machine again.
             self.raft_group.advance_apply().await;
@@ -272,69 +279,27 @@ impl Node {
             peer_futures.push(future);
         }
         let peers = futures::future::join_all(peer_futures).await;
-        self.peers.extend(peers.into_iter());
+        self.peers.extend(peers);
 
         Ok(())
     }
 
-    async fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) -> Result<()> {
+    fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) {
         for entry in committed_entries {
             if !entry.data.is_empty() {
-                let command = Command::new(entry.data)?;
-                let db = self.db.clone();
-                let join_handle: JoinHandle<Result<Option<Bytes>>> = spawn_blocking(move || {
-                    // Raft log is what provides durability, not the LSM tree. Any writes that are
-                    // not persisted will be replayed from the Raft log.
-                    let create_options =
-                        KeyspaceCreateOptions::default().manual_journal_persist(true);
-                    let items = db.keyspace(GLOBAL_KEYSPACE, || create_options)?;
-                    let response = match command.command_inner {
-                        CommandInner::Insert { tuple } => {
-                            let (key, value) = tuple.to_key_value();
-                            items.insert(key.as_ref(), value.as_ref())?;
-                            None
-                        }
-                        CommandInner::Read { key } => {
-                            let value = items.get(key)?;
-                            value.map(|value| value.to_vec().into())
-                        }
-                        CommandInner::Cas { cas_tuple } => {
-                            let (key, expected_value, desired_value) =
-                                cas_tuple.to_key_and_values();
-                            let current_value = items.get(&key)?;
-
-                            let matches_expected = match &current_value {
-                                Some(current_value) => {
-                                    current_value.as_ref() == expected_value.as_ref()
-                                }
-                                None => expected_value.is_empty(),
-                            };
-                            if matches_expected {
-                                items.insert(key.as_ref(), desired_value.as_ref())?;
-                                None
-                            } else {
-                                let current_value = current_value
-                                    .map_or(Bytes::new(), |value| value.to_vec().into());
-                                Some(current_value)
-                            }
-                        }
-                    };
-                    Ok(response)
-                });
-                let response = join_handle.await.expect("thread panicked")?;
-
-                let command_context = CommandContext::from_bytes(&entry.context);
-                if let Ok(command_context) = command_context
-                    && command_context.node_id == self.raft_group.id()
-                    && let Some(response_tx) =
+                let command_context = CommandContext::from_bytes(&entry.context).ok();
+                let response_tx = command_context.and_then(|command_context| {
+                    if command_context.node_id == self.raft_group.id() {
                         self.pending_commands.remove(&command_context.command_id)
-                {
-                    // Ignore errors if the client has hung up.
-                    let _ = response_tx.send(Ok(response));
-                }
+                    } else {
+                        None
+                    }
+                });
+                self.wal_applier_tx
+                    .send(CommittedEntry { entry, response_tx })
+                    .expect("wal applier never exits before main task");
             }
         }
-        Ok(())
     }
 
     fn allocate_command_context(&mut self, command_kind: CommandKind) -> Result<CommandContext> {
@@ -431,6 +396,72 @@ impl PeerClient {
         client
             .message(Request::new(MessageRequest { messages_bytes }))
             .await?;
+        Ok(())
+    }
+}
+
+struct CommittedEntry {
+    entry: Entry,
+    response_tx: Option<oneshot::Sender<std::result::Result<Option<Bytes>, Status>>>,
+}
+
+struct WalApplier {
+    rx: mpsc::UnboundedReceiver<CommittedEntry>,
+    db: fjall::Database,
+}
+
+impl WalApplier {
+    fn new(rx: mpsc::UnboundedReceiver<CommittedEntry>, db: fjall::Database) -> Self {
+        Self { rx, db }
+    }
+
+    /// Runs the [`WalApplier`] until it is shut down.
+    ///
+    /// This if a blocking method and should not be run in an async task.
+    fn run(mut self) -> Result<()> {
+        while let Some(CommittedEntry { entry, response_tx }) = self.rx.blocking_recv() {
+            let command = Command::new(entry.data)?;
+            let db = self.db.clone();
+
+            // Raft log is what provides durability, not the LSM tree. Any writes that are
+            // not persisted will be replayed from the Raft log.
+            let create_options = KeyspaceCreateOptions::default().manual_journal_persist(true);
+            let items = db.keyspace(GLOBAL_KEYSPACE, || create_options)?;
+            let response = match command.command_inner {
+                CommandInner::Insert { tuple } => {
+                    let (key, value) = tuple.to_key_value();
+                    items.insert(key.as_ref(), value.as_ref())?;
+                    None
+                }
+                CommandInner::Read { key } => {
+                    let value = items.get(key)?;
+                    value.map(|value| value.to_vec().into())
+                }
+                CommandInner::Cas { cas_tuple } => {
+                    let (key, expected_value, desired_value) = cas_tuple.to_key_and_values();
+                    let current_value = items.get(&key)?;
+
+                    let matches_expected = match &current_value {
+                        Some(current_value) => current_value.as_ref() == expected_value.as_ref(),
+                        None => expected_value.is_empty(),
+                    };
+                    if matches_expected {
+                        items.insert(key.as_ref(), desired_value.as_ref())?;
+                        None
+                    } else {
+                        let current_value =
+                            current_value.map_or(Bytes::new(), |value| value.to_vec().into());
+                        Some(current_value)
+                    }
+                }
+            };
+
+            if let Some(response_tx) = response_tx {
+                // Ignore errors if the client has hung up.
+                let _ = response_tx.send(Ok(response));
+            }
+        }
+
         Ok(())
     }
 }
