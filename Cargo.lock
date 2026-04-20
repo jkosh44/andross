@@ -36,6 +36,7 @@ dependencies = [
 name = "andross-server"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "bzip2",
  "clap",

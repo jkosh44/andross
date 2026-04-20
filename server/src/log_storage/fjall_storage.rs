@@ -124,7 +124,17 @@ impl Storage for FjallStorage {
             return Err(raft::Error::Store(StorageError::Unavailable));
         }
 
-        let size = std::cmp::min(high - low, max_size.into().unwrap_or(u64::MAX));
+        let max_size = max_size.into();
+
+        // eprintln!(
+        //     "ENTRIES low: {}, high: {}, max_size: {:?}, self.last_index(): {}",
+        //     low,
+        //     high,
+        //     max_size,
+        //     self.last_index()?
+        // );
+
+        let size = std::cmp::min(high - low, max_size.unwrap_or(u64::MAX));
         let high = low + size;
         let low = raft_index_to_key(low);
         let high = raft_index_to_key(high);
@@ -143,6 +153,9 @@ impl Storage for FjallStorage {
                 Ok(entry)
             })
             .collect::<raft::Result<_>>()?;
+
+        // eprintln!("ENTRIES: {entries:?}");
+
         Ok(entries)
     }
 

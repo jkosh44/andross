@@ -250,6 +250,11 @@ impl<T: LogStorage> RawNodeThread<T> {
                     response_tx.send(result).expect("senders never hang up");
                 }
             }
+            // eprintln!(
+            //     "RAW NODE: commit: {:?}, index {:?}",
+            //     self.raft_group.raft.raft_log.commit_info(),
+            //     self.raft_group.raft.raft_log.last_index()
+            // );
         }
     }
 }

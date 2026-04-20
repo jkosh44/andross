@@ -24,11 +24,17 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Uri};
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, async_trait};
 
 // TODO: Support multiple keyspaces.
 /// Fjall keyspace where all data is stored.
 const GLOBAL_KEYSPACE: &str = "andross";
+
+/// Trait to send messages from this node to a peer.
+#[async_trait]
+pub trait PeerClient {
+    async fn send_messages(&mut self, messages: Vec<raft::prelude::Message>) -> Result<()>;
+}
 
 pub enum Message {
     Command {
@@ -41,9 +47,11 @@ pub enum Message {
     RaftMessages(Vec<raft::prelude::Message>),
 }
 
-pub struct NodeConfig<T: LogStorage> {
+pub struct NodeConfig<T: LogStorage, F: Fn(Uri) -> P, P: PeerClient> {
     id: u64,
     peers: HashMap<u64, Uri>,
+    // TODO: This is gross, try to find a different way.
+    connect_to_peer: F,
     raft_tick_interval: Duration,
     default_request_timeout: Duration,
     log_storage: T,
@@ -71,18 +79,24 @@ pub struct Node {
 }
 
 impl Node {
-    async fn new<T: LogStorage + Send + 'static>(
+    async fn new<T, F, P>(
         NodeConfig {
             id,
             peers,
+            connect_to_peer,
             raft_tick_interval,
             default_request_timeout,
             mut log_storage,
             db,
             tx,
             rx,
-        }: NodeConfig<T>,
-    ) -> Result<Self> {
+        }: NodeConfig<T, F, P>,
+    ) -> Result<Self>
+    where
+        T: LogStorage + Send + 'static,
+        F: Fn(Uri) -> P,
+        P: PeerClient + Send + 'static,
+    {
         let voters = std::iter::once(id).chain(peers.keys().copied()).collect();
         let conf_state = ConfState {
             voters,
@@ -100,7 +114,7 @@ impl Node {
 
         let peers = peers
             .into_iter()
-            .map(|(id, addr)| (id, PeerClient::new(addr)))
+            .map(|(id, addr)| (id, connect_to_peer(addr)))
             .collect();
 
         let (wal_applier_tx, wal_applier_rx) = mpsc::unbounded_channel();
@@ -143,6 +157,7 @@ impl Node {
                     match message {
                         Some(Message::RaftMessages(messages)) => {
                             for message in messages {
+                                // eprintln!("STEPPING: {message:?}");
                                 self.raft_group.step(message).await?;
                             }
                             self.on_ready().await?;
@@ -151,6 +166,8 @@ impl Node {
                             let command_kind = command.kind();
                             let command_context = self.allocate_command_context(command_kind)?;
                             let command_id = command_context.command_id;
+
+                            // eprintln!("PROPOSING COMMAND");
 
                             // TODO: This is an unfortunate copy of `data`, there are no other
                             // references to the underlying bytes.
@@ -162,6 +179,8 @@ impl Node {
                             // Raft to avoid this expense.
                             match self.raft_group.propose(command_context.into_bytes(), command.into_bytes().to_vec()).await {
                                 Ok(()) => {
+                                    // eprintln!("PROPOSAL SUCCEEDED");
+
                                     let previous = self.pending_commands.insert(command_id, response_tx);
                                     assert!(previous.is_none(), "command ID reuse");
                                     let request_timeout = self.default_request_timeout;
@@ -200,6 +219,7 @@ impl Node {
                                     self.on_ready().await?;
                                 }
                                 Err(e) => {
+                                    // eprintln!("PROPOSAL FAILED: {e}");
                                     // Ignore errors if the client has hung up.
                                     let _ = response_tx.send(Err(Status::failed_precondition(e.to_string())));
                                 },
@@ -280,6 +300,7 @@ impl Node {
     fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) -> Result<()> {
         // TODO: batch entries.
         for entry in committed_entries {
+            // eprintln!("COMMITTED ENTRY: {entry:?}");
             if !entry.data.is_empty() {
                 let command_context = CommandContext::from_bytes(&entry.context).ok();
                 let response_tx = command_context.and_then(|command_context| {
@@ -320,6 +341,62 @@ pub struct NodeHandle {
     tx: mpsc::UnboundedSender<Message>,
 }
 
+impl NodeHandle {
+    pub async fn read(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let command = Command::read(key);
+        let CommandResponse { response_bytes } = self
+            .command(Request::new(CommandRequest {
+                command_bytes: command.into_bytes(),
+            }))
+            .await?
+            .into_inner();
+        Ok(response_bytes)
+    }
+
+    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let command = Command::insert(key, value);
+        let CommandResponse { response_bytes } = self
+            .command(Request::new(CommandRequest {
+                command_bytes: command.into_bytes(),
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(
+            response_bytes, None,
+            "write command must not return a value"
+        );
+        Ok(())
+    }
+
+    pub async fn cas(
+        &self,
+        key: &[u8],
+        expected_value: &[u8],
+        desired_value: &[u8],
+    ) -> Result<Option<Bytes>> {
+        let command = Command::cas(key, expected_value, desired_value);
+        let CommandResponse { response_bytes } = self
+            .command(Request::new(CommandRequest {
+                command_bytes: command.into_bytes(),
+            }))
+            .await?
+            .into_inner();
+        Ok(response_bytes)
+    }
+
+    pub fn execute_messages(
+        &self,
+        messages: Vec<raft::prelude::Message>,
+    ) -> std::result::Result<(), mpsc::error::SendError<Vec<raft::prelude::Message>>> {
+        self.tx.send(Message::RaftMessages(messages)).map_err(|e| {
+            let Message::RaftMessages(messages) = e.0 else {
+                unreachable!("set to RaftMessages variant in send");
+            };
+            mpsc::error::SendError(messages)
+        })
+    }
+}
+
 #[tonic::async_trait]
 impl KvService for NodeHandle {
     async fn command(
@@ -358,23 +435,19 @@ impl RaftService for NodeHandle {
             })
             .collect::<ProtobufResult<Vec<_>>>()
             .map_err(|_| Status::invalid_argument("Failed to parse raft message"))?;
-        self.tx
-            .send(Message::RaftMessages(messages))
+        self.execute_messages(messages)
             .map_err(|_| Status::unavailable("Server is shutting down"))?;
         Ok(Response::new(MessageResponse {}))
     }
 }
 
-struct MessageSender {
+struct MessageSender<P: PeerClient> {
     rx: mpsc::UnboundedReceiver<raft::prelude::Message>,
-    peers: HashMap<u64, PeerClient>,
+    peers: HashMap<u64, P>,
 }
 
-impl MessageSender {
-    fn new(
-        rx: mpsc::UnboundedReceiver<raft::prelude::Message>,
-        peers: HashMap<u64, PeerClient>,
-    ) -> Self {
+impl<P: PeerClient> MessageSender<P> {
+    fn new(rx: mpsc::UnboundedReceiver<raft::prelude::Message>, peers: HashMap<u64, P>) -> Self {
         Self { rx, peers }
     }
 
@@ -394,16 +467,19 @@ impl MessageSender {
     }
 }
 
-struct PeerClient {
+pub(crate) struct GrpcPeerClient {
     addr: Uri,
     client: Option<RaftServiceClient<Channel>>,
 }
 
-impl PeerClient {
-    fn new(addr: Uri) -> Self {
+impl GrpcPeerClient {
+    pub(crate) fn new(addr: Uri) -> Self {
         Self { addr, client: None }
     }
+}
 
+#[async_trait]
+impl PeerClient for GrpcPeerClient {
     async fn send_messages(&mut self, messages: Vec<raft::prelude::Message>) -> Result<()> {
         let client = if let Some(client) = &mut self.client {
             client
@@ -541,18 +617,25 @@ impl CommandContext {
 /// # Errors
 ///
 /// Returns an error if the Raft node fails to initialize.
-pub async fn initialize<T: LogStorage + Send + 'static>(
+pub async fn initialize<T, F, P>(
     id: u64,
     peers: HashMap<u64, Uri>,
+    connect_to_peer: F,
     raft_tick_interval: Duration,
     default_request_timeout: Duration,
     log_storage: T,
     db: fjall::Database,
-) -> Result<(Node, NodeHandle)> {
+) -> Result<(Node, NodeHandle)>
+where
+    T: LogStorage + Send + 'static,
+    F: Fn(Uri) -> P,
+    P: PeerClient + Send + 'static,
+{
     let (tx, rx) = mpsc::unbounded_channel();
     let node_config = NodeConfig {
         id,
         peers,
+        connect_to_peer,
         raft_tick_interval,
         default_request_timeout,
         log_storage,
@@ -588,6 +671,7 @@ mod tests {
         let (node, node_handle) = initialize(
             1,
             HashMap::new(),
+            GrpcPeerClient::new,
             Duration::from_millis(1),
             Duration::from_secs(1),
             MemStorage::new(),

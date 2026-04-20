@@ -14,6 +14,11 @@ fn test_maelstrom_echo() {
     run_maelstrom_workload("echo");
 }
 
+#[test]
+fn test_maelstrom_broadcast() {
+    run_maelstrom_workload("broadcast");
+}
+
 /// Runs a maelstrom workload.
 fn run_maelstrom_workload(workload: &str) {
     let project_root_str = env!("CARGO_MANIFEST_DIR");
@@ -41,6 +46,7 @@ fn run_maelstrom_workload(workload: &str) {
         "3",
         "--time-limit",
         "10",
+        "--log-stderr",
     ];
     let exit_status = Command::new(maelstrom_bin)
         .args(args)
