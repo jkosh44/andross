@@ -13,7 +13,6 @@ use crate::service::raft_service_server::RaftService;
 use crate::service::{CommandRequest, CommandResponse, MessageRequest, MessageResponse};
 use bytes::Bytes;
 use fjall::KeyspaceCreateOptions;
-use itertools::Itertools;
 use protobuf::{Message as ProtobufMessage, ProtobufResult};
 use raft::prelude::{ConfState, Entry};
 use raft::{Config, RawNode};
@@ -55,7 +54,6 @@ pub struct NodeConfig<T: LogStorage> {
 
 pub struct Node {
     raft_group: AsyncRawNode,
-    peers: HashMap<u64, PeerClient>,
 
     next_command_id: u64,
     pending_commands: HashMap<u64, oneshot::Sender<std::result::Result<Option<Bytes>, Status>>>,
@@ -67,6 +65,9 @@ pub struct Node {
 
     wal_applier_tx: mpsc::UnboundedSender<CommittedEntry>,
     wal_applier_handle: thread::JoinHandle<Result<()>>,
+
+    message_sender_tx: mpsc::UnboundedSender<raft::prelude::Message>,
+    message_sender_handle: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl Node {
@@ -106,9 +107,12 @@ impl Node {
         let wal_applier = WalApplier::new(wal_applier_rx, db);
         let wal_applier_handle = thread::spawn(move || wal_applier.run());
 
+        let (message_sender_tx, message_sender_rx) = mpsc::unbounded_channel();
+        let message_sender = MessageSender::new(message_sender_rx, peers);
+        let message_sender_handle = tokio::spawn(async move { message_sender.run().await });
+
         Ok(Self {
             raft_group,
-            peers,
             next_command_id: u64::MIN,
             pending_commands: HashMap::new(),
             raft_tick_interval,
@@ -117,6 +121,8 @@ impl Node {
             rx,
             wal_applier_tx,
             wal_applier_handle,
+            message_sender_tx,
+            message_sender_handle,
         })
     }
 
@@ -221,6 +227,10 @@ impl Node {
 
         drop(self.wal_applier_tx);
         spawn_blocking(move || self.wal_applier_handle.join().expect("thread panicked")).await??;
+
+        drop(self.message_sender_tx);
+        self.message_sender_handle.await??;
+
         Ok(())
     }
 
@@ -229,19 +239,18 @@ impl Node {
             let mut ready = self.raft_group.ready().await;
 
             // Handle ready tasks.
-            self.handle_messages(ready.take_messages()).await?;
+            self.handle_messages(ready.take_messages())?;
             if !ready.snapshot().is_empty() {
                 unimplemented!("snapshots are not yet supported");
             }
-            self.handle_committed_entries(ready.take_committed_entries());
+            self.handle_committed_entries(ready.take_committed_entries())?;
             if !ready.entries().is_empty() {
                 self.mut_store().append(ready.take_entries()).await?;
             }
             if let Some(hard_state) = ready.hs() {
                 self.mut_store().set_hard_state(hard_state.clone()).await?;
             }
-            self.handle_messages(ready.take_persisted_messages())
-                .await?;
+            self.handle_messages(ready.take_persisted_messages())?;
 
             // Advance the Raft state machine.
             let mut light_ready = self.raft_group.advance(ready).await;
@@ -250,8 +259,8 @@ impl Node {
             if let Some(commit_index) = light_ready.commit_index() {
                 self.mut_store().set_commit_index(commit_index).await?;
             }
-            self.handle_messages(light_ready.take_messages()).await?;
-            self.handle_committed_entries(light_ready.take_committed_entries());
+            self.handle_messages(light_ready.take_messages())?;
+            self.handle_committed_entries(light_ready.take_committed_entries())?;
 
             // Advance the Raft state machine again.
             self.raft_group.advance_apply().await;
@@ -260,31 +269,16 @@ impl Node {
         Ok(())
     }
 
-    async fn handle_messages(&mut self, messages: Vec<raft::prelude::Message>) -> Result<()> {
-        let messages = messages
-            .into_iter()
-            .into_group_map_by(raft::prelude::Message::get_to);
-        let mut peer_futures = Vec::with_capacity(messages.len());
-        for (to, messages) in messages {
-            let mut peer = self
-                .peers
-                .remove(&to)
-                .ok_or_else(|| format!("unknown peer: {to}"))?;
-            let future = async move {
-                // We can ignore errors, Raft will retry messages if it's necessary.
-                // TODO: Debug or trace this once logging is set up.
-                let _result = peer.send_messages(messages).await;
-                (to, peer)
-            };
-            peer_futures.push(future);
+    fn handle_messages(&mut self, messages: Vec<raft::prelude::Message>) -> Result<()> {
+        // TODO batch messages.
+        for message in messages {
+            self.message_sender_tx.send(message)?;
         }
-        let peers = futures::future::join_all(peer_futures).await;
-        self.peers.extend(peers);
-
         Ok(())
     }
 
-    fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) {
+    fn handle_committed_entries(&mut self, committed_entries: Vec<Entry>) -> Result<()> {
+        // TODO: batch entries.
         for entry in committed_entries {
             if !entry.data.is_empty() {
                 let command_context = CommandContext::from_bytes(&entry.context).ok();
@@ -296,10 +290,11 @@ impl Node {
                     }
                 });
                 self.wal_applier_tx
-                    .send(CommittedEntry { entry, response_tx })
-                    .expect("wal applier never exits before main task");
+                    .send(CommittedEntry { entry, response_tx })?;
             }
         }
+
+        Ok(())
     }
 
     fn allocate_command_context(&mut self, command_kind: CommandKind) -> Result<CommandContext> {
@@ -367,6 +362,35 @@ impl RaftService for NodeHandle {
             .send(Message::RaftMessages(messages))
             .map_err(|_| Status::unavailable("Server is shutting down"))?;
         Ok(Response::new(MessageResponse {}))
+    }
+}
+
+struct MessageSender {
+    rx: mpsc::UnboundedReceiver<raft::prelude::Message>,
+    peers: HashMap<u64, PeerClient>,
+}
+
+impl MessageSender {
+    fn new(
+        rx: mpsc::UnboundedReceiver<raft::prelude::Message>,
+        peers: HashMap<u64, PeerClient>,
+    ) -> Self {
+        Self { rx, peers }
+    }
+
+    async fn run(mut self) -> Result<()> {
+        while let Some(message) = self.rx.recv().await {
+            let to = message.get_to();
+            let peer = self
+                .peers
+                .get_mut(&to)
+                .ok_or_else(|| format!("unknown peer: {to}"))?;
+            // We can ignore errors, Raft will retry messages if it's necessary.
+            // TODO: Debug or trace this once logging is set up.
+            let _result = peer.send_messages(vec![message]).await;
+        }
+
+        Ok(())
     }
 }
 
